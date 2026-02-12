@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-const WS_URL = `ws://${window.location.hostname}:7001`;
+// Use the same host and port as the current page
+const WS_URL = `ws://${window.location.host}`;
 
 function useWebSocket() {
   const [isConnected, setIsConnected] = useState(false);

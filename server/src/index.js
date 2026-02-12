@@ -86,10 +86,11 @@ setupWebSocket(wss);
 // Export for use in other modules
 export { wss };
 
-// Start server
-server.listen(PORT, () => {
-  logger.info(`[SERVER] 服务器已启动: http://localhost:${PORT}`);
-  logger.info(`[WEBSOCKET] WebSocket 已启动: ws://localhost:${PORT}`);
+// Start server - bind to 0.0.0.0 to allow external access
+server.listen(PORT, '0.0.0.0', () => {
+  logger.info(`[SERVER] 服务器已启动: http://0.0.0.0:${PORT}`);
+  logger.info(`[WEBSOCKET] WebSocket 已启动: ws://0.0.0.0:${PORT}`);
+  logger.info(`[提示] 局域网访问请使用本机IP地址`);
 });
 
 // Graceful shutdown

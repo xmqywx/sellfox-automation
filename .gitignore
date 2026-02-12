@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build output
+client/dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Uploads
+uploads/
+*.xlsx
+*.xls
+
+# Config (may contain sensitive data)
+config.yaml
+
+# Temporary files
+tmp/
+temp/

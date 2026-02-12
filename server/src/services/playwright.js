@@ -54,17 +54,74 @@ export async function connectToChrome(port = 9222) {
     }
 
     // Connect to Chrome via CDP
+    logger.info(`正在连接到 Chrome CDP: http://127.0.0.1:${debugPort}`);
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${debugPort}`);
     logger.success(`已连接到 Chrome (端口: ${debugPort})`);
 
-    // Get existing contexts
+    // Get existing contexts and find the best page
     const contexts = browser.contexts();
+    logger.info(`找到 ${contexts.length} 个浏览器上下文`);
+
     if (contexts.length > 0) {
       context = contexts[0];
       const pages = context.pages();
-      if (pages.length > 0) {
-        page = pages[0];
+      logger.info(`找到 ${pages.length} 个页面`);
+
+      // Log all pages for debugging
+      pages.forEach((p, i) => {
+        try {
+          const url = p.url();
+          logger.info(`页面 ${i}: ${url}`);
+        } catch (e) {
+          logger.info(`页面 ${i}: (无法获取URL)`);
+        }
+      });
+
+      // Prefer Sellfox page if available
+      let selectedPage = null;
+      for (const p of pages) {
+        try {
+          const url = p.url();
+          if (url && (url.includes('sellfox') || url.includes('orderShip'))) {
+            selectedPage = p;
+            logger.info(`选择 Sellfox 页面: ${url}`);
+            break;
+          }
+        } catch {
+          continue;
+        }
       }
+
+      // Otherwise use first page
+      if (!selectedPage && pages.length > 0) {
+        selectedPage = pages[0];
+        try {
+          logger.info(`使用第一个页面: ${selectedPage.url()}`);
+        } catch {
+          logger.info(`使用第一个页面 (URL不可用)`);
+        }
+      }
+
+      page = selectedPage;
+
+      // Set up page event listeners for debugging
+      if (page) {
+        page.on('console', msg => {
+          if (msg.type() === 'error') {
+            logger.info(`[页面控制台错误] ${msg.text()}`);
+          }
+        });
+
+        page.on('pageerror', err => {
+          logger.info(`[页面错误] ${err.message}`);
+        });
+      }
+    }
+
+    // If no page found, create one
+    if (!page && context) {
+      logger.info('没有找到现有页面，创建新页面...');
+      page = await context.newPage();
     }
 
     emitEvent('status', { status: 'connected', port: debugPort });
@@ -77,6 +134,7 @@ export async function connectToChrome(port = 9222) {
     };
   } catch (error) {
     logger.error('连接 Chrome 失败:', error.message);
+    logger.error('错误详情:', error.stack);
     emitEvent('error', { message: error.message });
     return {
       success: false,

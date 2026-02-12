@@ -216,13 +216,25 @@ async function searchOrders(page, orderIds) {
   // Target the search input inside .sel_ipt container
   const searchInputSelector = '.sel_ipt .multi_search_input input.el-input__inner, .sel_ipt input[placeholder*="双击可批量搜索"]';
 
+  // Log current page URL for debugging
+  try {
+    const currentUrl = page.url();
+    logger.info(`当前页面URL: ${currentUrl}`);
+  } catch (e) {
+    logger.info(`无法获取当前页面URL: ${e.message}`);
+  }
+
   try {
     // Wait for search input to be visible
-    await page.waitForSelector(searchInputSelector, { timeout: 5000 });
+    logger.info(`等待搜索输入框: ${searchInputSelector}`);
+    await page.waitForSelector(searchInputSelector, { timeout: 10000 });
+    logger.info('找到搜索输入框');
 
     // Double-click to activate batch search mode (opens a textarea/popup)
+    logger.info('双击搜索输入框激活批量搜索模式...');
     await page.dblclick(searchInputSelector);
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(1500);
+    logger.info('双击完成，等待批量输入框出现...');
 
     // After double-click, a textarea might appear for batch input
     // Try to find the textarea or input that accepts batch content
@@ -242,8 +254,25 @@ async function searchOrders(page, orderIds) {
 
     if (batchInput) {
       // Found batch textarea, enter order IDs one per line (with space before newline)
+      logger.info('找到批量输入框，正在填写订单号...');
       const searchText = orderIds.map(id => id + ' ').join('\n');
-      await batchInput.fill(searchText);
+      logger.info(`填写内容: ${searchText.substring(0, 100)}${searchText.length > 100 ? '...' : ''}`);
+
+      try {
+        // Clear first then fill
+        await batchInput.click();
+        await batchInput.fill('');
+        await page.waitForTimeout(200);
+        await batchInput.fill(searchText);
+        logger.info('订单号填写完成');
+      } catch (fillError) {
+        logger.info(`fill方法失败: ${fillError.message}，尝试type方法...`);
+        // Fallback to type if fill fails
+        await batchInput.click();
+        await page.keyboard.press('Control+a');
+        await page.keyboard.type(searchText, { delay: 10 });
+        logger.info('使用type方法填写完成');
+      }
       await page.waitForTimeout(500);
 
       // Click search button in the popup

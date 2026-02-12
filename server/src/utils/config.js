@@ -11,7 +11,7 @@ const CONFIG_PATH = path.join(__dirname, '../../../config.yaml');
 // Default configuration
 const defaultConfig = {
   server: {
-    port: 3001,
+    port: 7001,
     enableLogging: true,
   },
   chrome: {

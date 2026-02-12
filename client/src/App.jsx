@@ -37,7 +37,18 @@ function App() {
   }, []);
 
   // WebSocket connection
-  const { isConnected: wsConnected, lastMessage } = useWebSocket();
+  const { isConnected: wsConnected, lastMessage, connectionError: wsError } = useWebSocket();
+
+  // Log WebSocket errors
+  useEffect(() => {
+    if (wsError) {
+      console.error('WebSocket Error:', wsError);
+      setLogs((prev) => [
+        ...prev.slice(-99),
+        { type: 'error', message: wsError, timestamp: Date.now() },
+      ]);
+    }
+  }, [wsError]);
 
   // Handle WebSocket messages
   useEffect(() => {

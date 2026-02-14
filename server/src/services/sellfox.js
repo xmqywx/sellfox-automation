@@ -1592,7 +1592,7 @@ async function handleWarehouseSelectionFallback(page) {
 }
 
 /**
- * Click auto compare button
+ * Click auto compare button and wait for comparison to complete
  * @param {Object} page - Playwright page
  */
 async function clickAutoCompare(page) {
@@ -1661,7 +1661,130 @@ async function clickAutoCompare(page) {
     }
   }
 
-  await page.waitForTimeout(1000);
+  // Wait for auto compare to complete
+  logger.info('等待自动比价完成...');
+  await waitForAutoCompareComplete(page);
+}
+
+/**
+ * Wait for auto compare request to complete
+ * @param {Object} page - Playwright page
+ */
+async function waitForAutoCompareComplete(page) {
+  const maxWaitTime = 60000; // 60 seconds max
+  const checkInterval = 1000; // Check every 1 second
+  let elapsed = 0;
+
+  while (elapsed < maxWaitTime) {
+    await page.waitForTimeout(checkInterval);
+    elapsed += checkInterval;
+
+    // Check if loading indicator is gone and data is loaded
+    const status = await page.evaluate(() => {
+      // Check for loading indicators
+      const loadingSpinner = document.querySelector('.el-loading-mask:not([style*="display: none"]), .vxe-table--loading:not([style*="display: none"])');
+      const isLoading = loadingSpinner && loadingSpinner.offsetParent !== null;
+
+      // Check if table has data in "物流比价" or "发货渠道" columns
+      const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
+      if (!dialog) return { loading: false, hasData: false, error: '对话框未找到' };
+
+      // Look for cells with actual logistics data (not placeholder text)
+      const cells = dialog.querySelectorAll('.vxe-body--column');
+      let hasLogisticsData = false;
+      for (const cell of cells) {
+        const text = cell.textContent.trim();
+        // Check if cell contains actual logistics info (price, time, etc.)
+        if (text.includes('￥') || text.includes('元') || text.includes('天') || text.includes('h')) {
+          hasLogisticsData = true;
+          break;
+        }
+      }
+
+      return {
+        loading: isLoading,
+        hasData: hasLogisticsData
+      };
+    });
+
+    if (!status.loading && status.hasData) {
+      logger.info(`自动比价完成 (耗时: ${elapsed / 1000}秒)`);
+      return;
+    }
+
+    if (elapsed % 5000 === 0) {
+      logger.info(`等待自动比价... (${elapsed / 1000}秒, loading=${status.loading}, hasData=${status.hasData})`);
+    }
+  }
+
+  logger.info('自动比价等待超时，继续执行...');
+}
+
+/**
+ * Click save button in the dialog footer
+ * @param {Object} page - Playwright page
+ */
+async function clickSaveButton(page) {
+  logger.info('准备点击"保存"按钮...');
+
+  await page.waitForTimeout(500);
+
+  const clickResult = await page.evaluate(() => {
+    const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
+    if (!dialog) {
+      return { success: false, error: '对话框未找到' };
+    }
+
+    // Find the footer section
+    const footer = dialog.querySelector('.el-dialog__footer');
+    if (!footer) {
+      return { success: false, error: '对话框footer未找到' };
+    }
+
+    // Find the primary "保存" button (not "保存并下单")
+    const buttons = footer.querySelectorAll('button');
+    for (const btn of buttons) {
+      const text = btn.textContent.trim().replace(/\s+/g, '');
+      // Match "保存" but not "保存并下单"
+      if (text === '保存' && btn.classList.contains('el-button--primary')) {
+        btn.click();
+        return { success: true, message: '已点击"保存"按钮' };
+      }
+    }
+
+    // Fallback: find any primary button with "保存"
+    for (const btn of buttons) {
+      const text = btn.textContent.trim();
+      if (text.includes('保') && text.includes('存') && !text.includes('下单')) {
+        btn.click();
+        return { success: true, message: '已点击"保存"按钮 (fallback)' };
+      }
+    }
+
+    const buttonTexts = Array.from(buttons).map(b => b.textContent.trim());
+    return { success: false, error: '未找到保存按钮', buttons: buttonTexts };
+  });
+
+  if (clickResult.success) {
+    logger.info(clickResult.message);
+  } else {
+    logger.info(`保存按钮点击失败: ${clickResult.error}`);
+    if (clickResult.buttons) {
+      logger.info(`可用按钮: ${clickResult.buttons.join(', ')}`);
+    }
+
+    // Try Playwright locator as fallback
+    try {
+      const saveBtn = page.locator('.el-dialog__footer button.el-button--primary:has-text("保存")').first();
+      await saveBtn.click({ force: true });
+      logger.info('已点击"保存"按钮 (Playwright)');
+    } catch (e) {
+      logger.info(`Playwright点击失败: ${e.message}`);
+    }
+  }
+
+  // Wait for save to complete
+  await page.waitForTimeout(2000);
 }
 
 /**
@@ -1681,7 +1804,7 @@ export async function runAutomation(orderIds, warehouseName) {
   }
 
   const config = loadConfig();
-  const totalSteps = 7;
+  const totalSteps = 8;
 
   updateAutomationState({
     status: 'running',
@@ -1742,17 +1865,22 @@ export async function runAutomation(orderIds, warehouseName) {
       await clickAutoCompare(page);
     });
 
-    // Notify user that automation is complete but NOT auto-saved
+    // Step 8: Click save button
+    await executeStep('点击"保存"按钮', async () => {
+      await clickSaveButton(page);
+    });
+
+    // Notify user that automation is complete
     emitEvent('log', {
       type: 'success',
-      message: '自动化流程完成！请检查比价结果后手动保存。',
+      message: '自动化流程完成！已自动保存。',
       timestamp: Date.now(),
     });
 
     emitEvent('notification', {
-      type: 'warning',
-      title: '需要手动确认',
-      message: '物流比价已完成，请检查结果后手动点击保存按钮。',
+      type: 'success',
+      title: '自动化完成',
+      message: '物流比价和保存已完成。',
     });
 
     // Take final screenshot

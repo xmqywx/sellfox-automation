@@ -644,81 +644,396 @@ async function selectWarehouse(page, warehouseName) {
   // Click "批量" button in the store warehouse column header to open warehouse selector
   logger.info('点击店铺仓库"批量"按钮...');
 
-  const clickBatchResult = await page.evaluate(() => {
-    // Find the dialog
+  // First, list ALL 批量 buttons with their context for debugging
+  const debugInfo = await page.evaluate(() => {
     const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
-    if (!dialog) return { success: false, error: '未找到对话框' };
+    if (!dialog) {
+      return { hasDialog: false };
+    }
 
-    // Find all table headers with "店铺仓库" and "批量"
-    const headers = dialog.querySelectorAll('.vxe-cell--title');
-    for (const h of headers) {
-      if (h.textContent.includes('店铺仓库') && h.textContent.includes('批量')) {
-        const batchBtn = h.querySelector('button.el-button--text');
-        if (batchBtn) {
-          batchBtn.click();
-          return { success: true, message: '已点击店铺仓库批量按钮' };
+    // Find ALL buttons with "批量" text
+    const allButtons = dialog.querySelectorAll('button');
+    const batchButtons = [];
+
+    for (let i = 0; i < allButtons.length; i++) {
+      const btn = allButtons[i];
+      if (btn.textContent.trim() === '批量') {
+        // Get context - find nearest header/label
+        const cell = btn.closest('.vxe-cell, .vxe-cell--title, th, td');
+        const cellText = cell?.textContent?.replace(/\s+/g, ' ').substring(0, 60) || 'no cell';
+
+        // Check if inside batch_temu_select
+        const inBatchTemuSelect = !!btn.closest('.batch_temu_select');
+
+        // Get position
+        const rect = btn.getBoundingClientRect();
+
+        batchButtons.push({
+          index: i,
+          cellText,
+          inBatchTemuSelect,
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          visible: rect.width > 0 && rect.height > 0
+        });
+      }
+    }
+
+    // Find the one specifically next to "店铺仓库" text
+    // Look for the pattern: <span>店铺仓库</span> followed by batch_temu_select
+    const storeWarehouseButtons = [];
+    const spans = dialog.querySelectorAll('span');
+    for (const span of spans) {
+      if (span.textContent.trim() === '店铺仓库') {
+        // Look for sibling batch_temu_select
+        const parent = span.parentElement;
+        const batchSelect = parent?.querySelector('.batch_temu_select');
+        if (batchSelect) {
+          const btn = batchSelect.querySelector('button');
+          if (btn) {
+            const rect = btn.getBoundingClientRect();
+            storeWarehouseButtons.push({
+              spanText: span.textContent,
+              parentTag: parent?.tagName,
+              buttonText: btn.textContent.trim(),
+              x: Math.round(rect.x),
+              y: Math.round(rect.y)
+            });
+          }
         }
       }
     }
-    return { success: false, error: '未找到店铺仓库批量按钮' };
+
+    return {
+      hasDialog: true,
+      totalBatchButtons: batchButtons.length,
+      batchButtons: batchButtons.slice(0, 30), // Show first 30
+      storeWarehouseButtons
+    };
+  });
+
+  logger.info(`找到 ${debugInfo.totalBatchButtons} 个批量按钮`);
+  logger.info(`店铺仓库旁的批量按钮: ${JSON.stringify(debugInfo.storeWarehouseButtons)}`);
+
+  // Log first few batch buttons for context
+  if (debugInfo.batchButtons) {
+    for (const btn of debugInfo.batchButtons.slice(0, 10)) {
+      logger.info(`批量按钮 #${btn.index}: "${btn.cellText}" inBatchTemuSelect=${btn.inBatchTemuSelect} pos=(${btn.x},${btn.y})`);
+    }
+  }
+
+  const clickBatchResult = await page.evaluate(() => {
+    // Find the dialog
+    const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
+    if (!dialog) {
+      const allDialogs = document.querySelectorAll('.el-dialog__wrapper');
+      return { success: false, error: `未找到对话框 (共${allDialogs.length}个)` };
+    }
+
+    // BEST METHOD: Find batch_temu_select with placeholder="选择店铺仓库"
+    // This is the most precise selector based on the HTML structure
+    const batchSelectByPlaceholder = dialog.querySelector('.batch_temu_select[placeholder="选择店铺仓库"]');
+    if (batchSelectByPlaceholder) {
+      // IMPORTANT: Click on .popover_trigger, not the button inside
+      // Element UI popover is triggered by clicking the trigger element
+      const popoverTrigger = batchSelectByPlaceholder.querySelector('.popover_trigger');
+      if (popoverTrigger) {
+        const rect = popoverTrigger.getBoundingClientRect();
+        console.log('找到店铺仓库批量按钮 popover_trigger:', rect.x, rect.y);
+
+        // Dispatch multiple events to ensure popover opens
+        popoverTrigger.focus();
+        popoverTrigger.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+        popoverTrigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        popoverTrigger.click();
+
+        return { success: true, message: `已点击店铺仓库批量按钮 (popover_trigger) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+      }
+
+      // Fallback: click the button
+      const btn = batchSelectByPlaceholder.querySelector('button');
+      if (btn) {
+        const rect = btn.getBoundingClientRect();
+        console.log('找到店铺仓库批量按钮 (placeholder):', rect.x, rect.y);
+        btn.click();
+        return { success: true, message: `已点击店铺仓库批量按钮 (button fallback) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+      }
+    }
+
+    // Method 2: Find batch_temu_select in thead (header row)
+    const theadBatchSelects = dialog.querySelectorAll('thead .batch_temu_select, .vxe-table--header .batch_temu_select');
+    console.log('thead中找到 batch_temu_select 数量:', theadBatchSelects.length);
+
+    for (const bts of theadBatchSelects) {
+      // Check if the column contains "店铺仓库" text
+      const th = bts.closest('th');
+      if (th) {
+        const headerText = th.textContent;
+        if (headerText.includes('店铺仓库') && !headerText.includes('Temu仓库')) {
+          const btn = bts.querySelector('button');
+          if (btn) {
+            const rect = btn.getBoundingClientRect();
+            btn.click();
+            return { success: true, message: `已点击店铺仓库批量按钮 (thead) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+          }
+        }
+      }
+    }
+
+    // Method 3: Find <span>店铺仓库</span> then look for sibling batch_temu_select
+    const spans = dialog.querySelectorAll('span');
+    for (const span of spans) {
+      const spanText = span.textContent.trim();
+      if (spanText === '店铺仓库') {
+        // Must be in header, not in body row
+        const isInHeader = span.closest('thead, .vxe-table--header');
+        if (!isInHeader) continue;
+
+        // Look in parent for batch_temu_select
+        const parent = span.parentElement;
+        if (!parent) continue;
+
+        const batchSelect = parent.querySelector('.batch_temu_select');
+        if (batchSelect) {
+          const btn = batchSelect.querySelector('button');
+          if (btn) {
+            const rect = btn.getBoundingClientRect();
+            btn.click();
+            return { success: true, message: `已点击店铺仓库批量按钮 (span sibling) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+          }
+        }
+
+        // Also check nextElementSibling
+        let sibling = span.nextElementSibling;
+        while (sibling) {
+          if (sibling.classList.contains('batch_temu_select')) {
+            const btn = sibling.querySelector('button');
+            if (btn) {
+              const rect = btn.getBoundingClientRect();
+              btn.click();
+              return { success: true, message: `已点击店铺仓库批量按钮 (nextSibling) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+            }
+          }
+          sibling = sibling.nextElementSibling;
+        }
+      }
+    }
+
+    // Method 4: Find all batch_temu_select and check th content
+    const batchTemuSelects = dialog.querySelectorAll('.batch_temu_select');
+    console.log('找到 batch_temu_select 数量:', batchTemuSelects.length);
+
+    for (const bts of batchTemuSelects) {
+      const th = bts.closest('th');
+      if (!th) continue;
+
+      const thText = th.textContent.replace(/\s+/g, ' ').trim();
+      // Must contain "店铺仓库" but NOT other types
+      if (thText.includes('店铺仓库') && !thText.includes('Temu仓库') && !thText.includes('包裹')) {
+        const btn = bts.querySelector('button');
+        if (btn) {
+          const rect = btn.getBoundingClientRect();
+          btn.click();
+          return { success: true, message: `已点击店铺仓库批量按钮 (th check) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+        }
+      }
+    }
+
+    // Debug info
+    const batchSelectInfo = Array.from(batchTemuSelects).map(bts => {
+      const th = bts.closest('th');
+      const placeholder = bts.getAttribute('placeholder');
+      return {
+        placeholder,
+        inTh: !!th,
+        thText: th?.textContent?.replace(/\s+/g, ' ').substring(0, 30) || 'no th'
+      };
+    });
+
+    return {
+      success: false,
+      error: '未找到店铺仓库批量按钮',
+      batchTemuSelectCount: batchTemuSelects.length,
+      batchSelectInfo
+    };
   });
 
   if (!clickBatchResult.success) {
     logger.info(`点击批量按钮失败: ${clickBatchResult.error}`);
+    if (clickBatchResult.batchSelectInfo) {
+      logger.info(`batch_temu_select详情: ${JSON.stringify(clickBatchResult.batchSelectInfo)}`);
+    }
     throw new Error('无法打开仓库选择器');
   }
 
   logger.info(clickBatchResult.message);
 
-  // Wait for dropdown to appear
-  await page.waitForTimeout(1500);
+  // Also try Playwright's native click as backup - more reliable for Element UI
+  try {
+    const batchTrigger = page.locator('.el-dialog__wrapper:not([style*="display: none"]) .batch_temu_select[placeholder="选择店铺仓库"] .popover_trigger');
+    const count = await batchTrigger.count();
+    if (count > 0) {
+      logger.info('使用 Playwright 原生点击 popover_trigger...');
+      await batchTrigger.first().click({ force: true });
+    }
+  } catch (e) {
+    logger.info(`Playwright点击失败: ${e.message}`);
+  }
 
-  // Detect menu type and select warehouses
-  const menuInfo = await page.evaluate(() => {
-    // Check for cascader menu (two-level) or simple checkbox list (one-level)
-    const cascaderMenus = document.querySelectorAll('.el-cascader-menu');
-    const cascaderNodes = document.querySelectorAll('.el-cascader-node');
-    const checkboxes = document.querySelectorAll('.el-checkbox');
+  // Wait for dropdown to appear (longer wait for Element UI popover)
+  await page.waitForTimeout(2000);
 
-    // Count visible checkboxes
-    let visibleCheckboxCount = 0;
-    for (const cb of checkboxes) {
-      const rect = cb.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        visibleCheckboxCount++;
+  // Debug: Check what popovers/menus appeared after clicking
+  const popoverDebug = await page.evaluate(() => {
+    // Check for el-popover that is now visible (not display:none)
+    const allPopovers = document.querySelectorAll('.el-popover');
+    const visiblePopovers = [];
+    for (const p of allPopovers) {
+      const style = window.getComputedStyle(p);
+      if (style.display !== 'none') {
+        visiblePopovers.push({
+          id: p.id,
+          className: p.className.substring(0, 50),
+          innerText: p.innerText?.substring(0, 100) || '',
+          hasSelectMenu: !!p.querySelector('.select-menu'),
+          hasCascader: !!p.querySelector('.el-cascader-menu')
+        });
       }
     }
 
-    // Debug info
+    // Check for select-menu anywhere on the page
+    const selectMenus = document.querySelectorAll('.select-menu');
+    const visibleSelectMenus = [];
+    for (const m of selectMenus) {
+      const rect = m.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        const items = m.querySelectorAll('.select-dropdown__item');
+        visibleSelectMenus.push({
+          width: rect.width,
+          height: rect.height,
+          itemCount: items.length
+        });
+      }
+    }
+
+    return {
+      visiblePopovers,
+      visibleSelectMenus
+    };
+  });
+
+  logger.info(`弹出菜单调试: popovers=${popoverDebug.visiblePopovers.length}, selectMenus=${popoverDebug.visibleSelectMenus.length}`);
+  if (popoverDebug.visiblePopovers.length > 0) {
+    logger.info(`Popover详情: ${JSON.stringify(popoverDebug.visiblePopovers)}`);
+  }
+  if (popoverDebug.visibleSelectMenus.length > 0) {
+    logger.info(`SelectMenu详情: ${JSON.stringify(popoverDebug.visibleSelectMenus)}`);
+  }
+
+  // Detect menu type and select warehouses
+  // IMPORTANT: Search in entire document, not just dialog, because popovers may be outside dialog
+  const menuInfo = await page.evaluate(() => {
+    // Check for custom sf_select menu (one-level)
+    const selectMenu = document.querySelector('.select-menu');
+    const dropdownItems = document.querySelectorAll('.select-dropdown__item');
+
+    // Check for cascader menu (two-level)
+    const cascaderMenus = document.querySelectorAll('.el-cascader-menu');
+    const cascaderNodes = document.querySelectorAll('.el-cascader-node');
+
+    // Check for Element UI checkboxes
+    const checkboxes = document.querySelectorAll('.el-checkbox');
+
+    // Check for el-select dropdown (another type of one-level menu)
+    const elSelectDropdown = document.querySelector('.el-select-dropdown:not([style*="display: none"])');
+    const elSelectItems = document.querySelectorAll('.el-select-dropdown__item');
+
+    // Check for popover content (common wrapper for dropdowns)
+    const popoverContent = document.querySelector('.el-popover:not([style*="display: none"]), .popover_content');
+
+    // Count visible items
+    let visibleDropdownItems = 0;
+    for (const item of dropdownItems) {
+      const rect = item.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) visibleDropdownItems++;
+    }
+
+    let visibleCheckboxes = 0;
+    for (const cb of checkboxes) {
+      const rect = cb.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) visibleCheckboxes++;
+    }
+
+    let visibleElSelectItems = 0;
+    for (const item of elSelectItems) {
+      const rect = item.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) visibleElSelectItems++;
+    }
+
+    // Get sample of what's visible on page for debugging
+    const visiblePopups = [];
+    const allPopovers = document.querySelectorAll('.el-popover, .popover_content, .el-select-dropdown, .select-menu, .el-cascader-menus');
+    for (const p of allPopovers) {
+      const rect = p.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        visiblePopups.push({
+          className: p.className.substring(0, 50),
+          childCount: p.children.length,
+          innerText: p.innerText?.substring(0, 100) || ''
+        });
+      }
+    }
+
     const debugInfo = {
+      hasSelectMenu: !!selectMenu,
+      dropdownItemCount: visibleDropdownItems,
       cascaderMenuCount: cascaderMenus.length,
       cascaderNodeCount: cascaderNodes.length,
-      checkboxCount: checkboxes.length,
-      visibleCheckboxCount
+      checkboxCount: visibleCheckboxes,
+      hasElSelectDropdown: !!elSelectDropdown,
+      elSelectItemCount: visibleElSelectItems,
+      hasPopover: !!popoverContent,
+      visiblePopups
     };
 
     console.log('菜单检测调试:', JSON.stringify(debugInfo));
 
-    // If we have visible checkboxes but no cascader menus, it's a simple checkbox list
-    if (visibleCheckboxCount > 0 && cascaderMenus.length === 0) {
+    // Priority 1: Custom sf_select menu (one-level)
+    if (selectMenu && visibleDropdownItems > 0) {
       return { type: 'one-level', menuCount: 1, debug: debugInfo };
     }
 
+    // Priority 2: el-select dropdown (one-level)
+    if (elSelectDropdown && visibleElSelectItems > 0) {
+      return { type: 'el-select', menuCount: 1, debug: debugInfo };
+    }
+
+    // Priority 3: Cascader menu with 2+ menus (two-level)
     if (cascaderMenus.length >= 2) {
-      // Two-level menu: has multiple cascader menu panels
       return { type: 'two-level', menuCount: cascaderMenus.length, debug: debugInfo };
     }
 
-    // Check for items with arrows (another indicator of two-level)
+    // Priority 4: Check for cascader items with arrows (indicates two-level)
+    let hasArrows = false;
     for (const item of cascaderNodes) {
       const arrow = item.querySelector('.el-icon-arrow-right, .el-cascader-node__postfix');
       if (arrow) {
-        return { type: 'two-level', menuCount: 1, debug: debugInfo };
+        hasArrows = true;
+        break;
       }
     }
 
-    // Default to one-level if we have checkboxes
-    if (visibleCheckboxCount > 0) {
+    // Single cascader menu without arrows = one-level
+    if (cascaderMenus.length === 1 && !hasArrows) {
+      return { type: 'one-level-cascader', menuCount: 1, debug: debugInfo };
+    }
+
+    if (cascaderMenus.length === 1 && hasArrows) {
+      return { type: 'two-level', menuCount: 1, debug: debugInfo };
+    }
+
+    // Priority 5: Element UI checkboxes (one-level)
+    if (visibleCheckboxes > 0 && cascaderMenus.length === 0) {
       return { type: 'one-level', menuCount: 1, debug: debugInfo };
     }
 
@@ -727,15 +1042,19 @@ async function selectWarehouse(page, warehouseName) {
 
   logger.info(`检测到仓库菜单类型: ${menuInfo.type}`);
   if (menuInfo.debug) {
-    logger.info(`菜单检测详情: cascader=${menuInfo.debug.cascaderMenuCount}, nodes=${menuInfo.debug.cascaderNodeCount}, checkboxes=${menuInfo.debug.visibleCheckboxCount}`);
+    logger.info(`菜单检测详情: selectMenu=${menuInfo.debug.hasSelectMenu}, items=${menuInfo.debug.dropdownItemCount}, cascader=${menuInfo.debug.cascaderMenuCount}`);
   }
 
-  if (menuInfo.type === 'one-level') {
+  if (menuInfo.type === 'one-level' || menuInfo.type === 'one-level-cascader' || menuInfo.type === 'el-select') {
     // One-level menu: select the first option after "全选"
-    await handleOneLevelWarehouseMenu(page);
-  } else {
+    await handleOneLevelWarehouseMenu(page, menuInfo.type);
+  } else if (menuInfo.type === 'two-level') {
     // Two-level menu: iterate through each first-level item and select from second level
     await handleTwoLevelWarehouseMenu(page);
+  } else {
+    // Unknown type - try one-level first, then two-level
+    logger.info('未知菜单类型，尝试一级菜单处理...');
+    await handleOneLevelWarehouseMenu(page, 'unknown');
   }
 
   // Wait a moment then click confirm button
@@ -744,18 +1063,73 @@ async function selectWarehouse(page, warehouseName) {
 
   // Click confirm button in the dropdown
   const confirmResult = await page.evaluate(() => {
-    // Find visible confirm button
-    const buttons = document.querySelectorAll('button');
-    for (const btn of buttons) {
-      if (btn.textContent.trim() === '确定' && btn.offsetParent !== null) {
-        const rect = btn.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0 && rect.y > 300) {
+    // Method 1: sf_select footer confirm button
+    const sfFooter = document.querySelector('.sf_select__footer');
+    if (sfFooter) {
+      const confirmBtn = sfFooter.querySelector('button.el-button--primary');
+      if (confirmBtn) {
+        confirmBtn.click();
+        return { success: true, message: '已点击确定按钮 (sf_select)' };
+      }
+    }
+
+    // Method 2: el-cascader panel footer confirm button
+    const cascaderPanels = document.querySelectorAll('.el-cascader-panel, .el-cascader-menus');
+    for (const panel of cascaderPanels) {
+      const rect = panel.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+
+      // Look for confirm button in or after the panel
+      const footer = panel.querySelector('.el-cascader__footer, footer, .footer');
+      if (footer) {
+        const btn = footer.querySelector('button');
+        if (btn) {
           btn.click();
-          return { success: true, message: '已点击确定按钮' };
+          return { success: true, message: '已点击确定按钮 (cascader footer)' };
         }
       }
     }
-    return { success: false, error: '未找到确定按钮' };
+
+    // Method 3: Find confirm button inside popover
+    const popovers = document.querySelectorAll('.el-popover, .popover_content, .popover_box');
+    for (const popover of popovers) {
+      const rect = popover.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+
+      const btns = popover.querySelectorAll('button');
+      for (const btn of btns) {
+        const text = btn.textContent.trim();
+        if (text === '确定' || text === '确认') {
+          btn.click();
+          return { success: true, message: '已点击确定按钮 (popover)' };
+        }
+      }
+    }
+
+    // Method 4: Find any visible primary button with "确定" text
+    const buttons = document.querySelectorAll('button');
+    const candidateButtons = [];
+    for (const btn of buttons) {
+      const text = btn.textContent.trim();
+      if ((text === '确定' || text === '确认') && btn.offsetParent !== null) {
+        const rect = btn.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          candidateButtons.push({ btn, rect });
+        }
+      }
+    }
+
+    // Sort by position (prefer buttons lower on page, likely in dropdown)
+    candidateButtons.sort((a, b) => b.rect.top - a.rect.top);
+
+    if (candidateButtons.length > 0) {
+      candidateButtons[0].btn.click();
+      return { success: true, message: `已点击确定按钮 (通用, y=${candidateButtons[0].rect.top})` };
+    }
+
+    // Method 5: Just close the dropdown by clicking elsewhere or pressing Escape
+    // Sometimes dropdowns auto-apply selection
+    return { success: false, error: '未找到确定按钮', candidateCount: candidateButtons.length };
   });
 
   if (confirmResult.success) {
@@ -769,72 +1143,135 @@ async function selectWarehouse(page, warehouseName) {
 
 /**
  * Handle one-level warehouse menu selection
+ * Supports both Element UI checkbox and custom sf_select component
  * @param {Object} page - Playwright page
+ * @param {string} menuType - Type of menu detected
  */
-async function handleOneLevelWarehouseMenu(page) {
-  logger.info('处理一级仓库菜单...');
+async function handleOneLevelWarehouseMenu(page, menuType = 'one-level') {
+  logger.info(`处理一级仓库菜单 (类型: ${menuType})...`);
 
-  const result = await page.evaluate(() => {
-    // Log all visible checkboxes for debugging
-    const allCheckboxes = document.querySelectorAll('.el-checkbox');
-    const debugInfo = [];
+  const result = await page.evaluate((type) => {
+    // First try: Custom sf_select component (vue-recycle-scroller)
+    const selectMenu = document.querySelector('.select-menu');
+    if (selectMenu) {
+      console.log('检测到自定义 select-menu 组件');
 
-    for (const checkbox of allCheckboxes) {
-      const label = checkbox.querySelector('.el-checkbox__label');
-      const input = checkbox.querySelector('.el-checkbox__input');
-      const inner = checkbox.querySelector('.el-checkbox__inner');
-      const rect = checkbox.getBoundingClientRect();
+      // Find all dropdown items
+      const items = selectMenu.querySelectorAll('.select-dropdown__item');
+      console.log('找到 dropdown items:', items.length);
 
-      if (rect.width > 0 && rect.height > 0) {
-        debugInfo.push({
-          text: label?.textContent?.trim() || '(no label)',
-          hasInput: !!input,
-          hasInner: !!inner,
-          isVisible: rect.width > 0
-        });
+      for (const item of items) {
+        // Get the label text
+        const label = item.querySelector('.main_label');
+        const text = label?.textContent?.trim() || label?.getAttribute('title') || '';
+
+        // Skip empty or "全选"
+        if (!text || text === '全选') continue;
+
+        // Check if visible
+        const rect = item.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        // Click the checkbox (.check_box) or the item itself
+        const checkbox = item.querySelector('.check_box');
+        if (checkbox) {
+          checkbox.click();
+          return { success: true, selected: text, method: 'sf_select_checkbox' };
+        }
+
+        // Fallback: click the item
+        item.click();
+        return { success: true, selected: text, method: 'sf_select_item' };
       }
     }
 
-    console.log('找到的复选框:', JSON.stringify(debugInfo));
+    // Second try: el-cascader-menu with checkboxes (single level)
+    const cascaderMenus = document.querySelectorAll('.el-cascader-menu');
+    console.log('找到 el-cascader-menu:', cascaderMenus.length);
 
-    // Find the first non-"全选" checkbox and click it
+    for (const menu of cascaderMenus) {
+      const rect = menu.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+
+      const nodes = menu.querySelectorAll('.el-cascader-node');
+      console.log('cascader menu nodes:', nodes.length);
+
+      for (const node of nodes) {
+        const label = node.querySelector('.el-cascader-node__label');
+        const text = label?.textContent?.trim() || '';
+
+        // Skip "全选"
+        if (!text || text === '全选') continue;
+
+        // Find checkbox
+        const checkboxInner = node.querySelector('.el-checkbox__inner');
+        const checkboxInput = node.querySelector('.el-checkbox__input');
+
+        if (checkboxInner) {
+          checkboxInner.click();
+          return { success: true, selected: text, method: 'cascader_checkbox_inner' };
+        }
+        if (checkboxInput) {
+          checkboxInput.click();
+          return { success: true, selected: text, method: 'cascader_checkbox_input' };
+        }
+
+        // Try clicking the node itself
+        node.click();
+        return { success: true, selected: text, method: 'cascader_node' };
+      }
+    }
+
+    // Third try: el-select dropdown items
+    const elSelectItems = document.querySelectorAll('.el-select-dropdown__item');
+    console.log('找到 el-select-dropdown__item:', elSelectItems.length);
+
+    for (const item of elSelectItems) {
+      const text = item.textContent?.trim() || '';
+
+      if (!text || text === '全选') continue;
+
+      const rect = item.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+
+      item.click();
+      return { success: true, selected: text, method: 'el_select_item' };
+    }
+
+    // Fourth try: Element UI checkbox anywhere
+    const allCheckboxes = document.querySelectorAll('.el-checkbox');
+    console.log('找到 el-checkbox:', allCheckboxes.length);
+
     for (const checkbox of allCheckboxes) {
       const label = checkbox.querySelector('.el-checkbox__label');
       const text = label?.textContent?.trim() || '';
 
-      // Skip "全选" and empty labels
-      if (!text || text === '全选' || text.includes('全选')) {
-        continue;
-      }
+      if (!text || text === '全选' || text.includes('全选')) continue;
 
-      // Check if visible
       const rect = checkbox.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) {
-        continue;
-      }
+      if (rect.width === 0 || rect.height === 0) continue;
 
-      // Try to click - multiple approaches
-      // Approach 1: Click the .el-checkbox__inner (the visual checkbox)
       const inner = checkbox.querySelector('.el-checkbox__inner');
       if (inner) {
         inner.click();
-        return { success: true, selected: text, method: 'inner' };
+        return { success: true, selected: text, method: 'el_checkbox_inner' };
       }
 
-      // Approach 2: Click the input
-      const input = checkbox.querySelector('.el-checkbox__input');
-      if (input) {
-        input.click();
-        return { success: true, selected: text, method: 'input' };
-      }
-
-      // Approach 3: Click the checkbox wrapper itself
       checkbox.click();
-      return { success: true, selected: text, method: 'wrapper' };
+      return { success: true, selected: text, method: 'el_checkbox' };
     }
 
+    // Debug info
+    const debugInfo = {
+      hasSelectMenu: !!selectMenu,
+      dropdownItemCount: selectMenu?.querySelectorAll('.select-dropdown__item').length || 0,
+      elCheckboxCount: allCheckboxes.length,
+      cascaderMenuCount: cascaderMenus.length,
+      elSelectItemCount: elSelectItems.length
+    };
+
     return { success: false, error: '未找到可选仓库', debug: debugInfo };
-  });
+  }, menuType);
 
   if (result.success) {
     logger.info(`一级菜单已选择: ${result.selected} (方法: ${result.method})`);

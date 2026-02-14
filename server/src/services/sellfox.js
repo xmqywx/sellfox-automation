@@ -677,24 +677,58 @@ async function selectWarehouse(page, warehouseName) {
   const menuInfo = await page.evaluate(() => {
     // Check for cascader menu (two-level) or simple checkbox list (one-level)
     const cascaderMenus = document.querySelectorAll('.el-cascader-menu');
-    if (cascaderMenus.length >= 2) {
-      // Two-level menu: has multiple cascader menu panels
-      return { type: 'two-level', menuCount: cascaderMenus.length };
-    }
+    const cascaderNodes = document.querySelectorAll('.el-cascader-node');
+    const checkboxes = document.querySelectorAll('.el-checkbox');
 
-    // Check for items with arrows (another indicator of two-level)
-    const items = document.querySelectorAll('.el-cascader-node');
-    for (const item of items) {
-      const arrow = item.querySelector('.el-icon-arrow-right, .el-cascader-node__postfix');
-      if (arrow) {
-        return { type: 'two-level', menuCount: 1 };
+    // Count visible checkboxes
+    let visibleCheckboxCount = 0;
+    for (const cb of checkboxes) {
+      const rect = cb.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        visibleCheckboxCount++;
       }
     }
 
-    return { type: 'one-level', menuCount: 1 };
+    // Debug info
+    const debugInfo = {
+      cascaderMenuCount: cascaderMenus.length,
+      cascaderNodeCount: cascaderNodes.length,
+      checkboxCount: checkboxes.length,
+      visibleCheckboxCount
+    };
+
+    console.log('菜单检测调试:', JSON.stringify(debugInfo));
+
+    // If we have visible checkboxes but no cascader menus, it's a simple checkbox list
+    if (visibleCheckboxCount > 0 && cascaderMenus.length === 0) {
+      return { type: 'one-level', menuCount: 1, debug: debugInfo };
+    }
+
+    if (cascaderMenus.length >= 2) {
+      // Two-level menu: has multiple cascader menu panels
+      return { type: 'two-level', menuCount: cascaderMenus.length, debug: debugInfo };
+    }
+
+    // Check for items with arrows (another indicator of two-level)
+    for (const item of cascaderNodes) {
+      const arrow = item.querySelector('.el-icon-arrow-right, .el-cascader-node__postfix');
+      if (arrow) {
+        return { type: 'two-level', menuCount: 1, debug: debugInfo };
+      }
+    }
+
+    // Default to one-level if we have checkboxes
+    if (visibleCheckboxCount > 0) {
+      return { type: 'one-level', menuCount: 1, debug: debugInfo };
+    }
+
+    return { type: 'unknown', menuCount: 0, debug: debugInfo };
   });
 
   logger.info(`检测到仓库菜单类型: ${menuInfo.type}`);
+  if (menuInfo.debug) {
+    logger.info(`菜单检测详情: cascader=${menuInfo.debug.cascaderMenuCount}, nodes=${menuInfo.debug.cascaderNodeCount}, checkboxes=${menuInfo.debug.visibleCheckboxCount}`);
+  }
 
   if (menuInfo.type === 'one-level') {
     // One-level menu: select the first option after "全选"
@@ -741,35 +775,74 @@ async function handleOneLevelWarehouseMenu(page) {
   logger.info('处理一级仓库菜单...');
 
   const result = await page.evaluate(() => {
-    // Find checkboxes in the dropdown
-    const labels = document.querySelectorAll('.el-checkbox__label, label');
-    let selected = null;
+    // Log all visible checkboxes for debugging
+    const allCheckboxes = document.querySelectorAll('.el-checkbox');
+    const debugInfo = [];
 
-    for (const label of labels) {
-      const text = label.textContent.trim();
-      // Skip "全选" and empty labels
-      if (text && text !== '全选' && !text.includes('全选')) {
-        // Find the checkbox input or the parent checkbox element
-        const checkboxWrapper = label.closest('.el-checkbox') || label.closest('label');
-        if (checkboxWrapper) {
-          const input = checkboxWrapper.querySelector('input[type="checkbox"]') ||
-                       checkboxWrapper.querySelector('.el-checkbox__input');
-          if (input) {
-            input.click();
-            selected = text;
-            break;
-          }
-        }
+    for (const checkbox of allCheckboxes) {
+      const label = checkbox.querySelector('.el-checkbox__label');
+      const input = checkbox.querySelector('.el-checkbox__input');
+      const inner = checkbox.querySelector('.el-checkbox__inner');
+      const rect = checkbox.getBoundingClientRect();
+
+      if (rect.width > 0 && rect.height > 0) {
+        debugInfo.push({
+          text: label?.textContent?.trim() || '(no label)',
+          hasInput: !!input,
+          hasInner: !!inner,
+          isVisible: rect.width > 0
+        });
       }
     }
 
-    return selected ? { success: true, selected } : { success: false, error: '未找到可选仓库' };
+    console.log('找到的复选框:', JSON.stringify(debugInfo));
+
+    // Find the first non-"全选" checkbox and click it
+    for (const checkbox of allCheckboxes) {
+      const label = checkbox.querySelector('.el-checkbox__label');
+      const text = label?.textContent?.trim() || '';
+
+      // Skip "全选" and empty labels
+      if (!text || text === '全选' || text.includes('全选')) {
+        continue;
+      }
+
+      // Check if visible
+      const rect = checkbox.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) {
+        continue;
+      }
+
+      // Try to click - multiple approaches
+      // Approach 1: Click the .el-checkbox__inner (the visual checkbox)
+      const inner = checkbox.querySelector('.el-checkbox__inner');
+      if (inner) {
+        inner.click();
+        return { success: true, selected: text, method: 'inner' };
+      }
+
+      // Approach 2: Click the input
+      const input = checkbox.querySelector('.el-checkbox__input');
+      if (input) {
+        input.click();
+        return { success: true, selected: text, method: 'input' };
+      }
+
+      // Approach 3: Click the checkbox wrapper itself
+      checkbox.click();
+      return { success: true, selected: text, method: 'wrapper' };
+    }
+
+    return { success: false, error: '未找到可选仓库', debug: debugInfo };
   });
 
   if (result.success) {
-    logger.info(`一级菜单已选择: ${result.selected}`);
+    logger.info(`一级菜单已选择: ${result.selected} (方法: ${result.method})`);
   } else {
     logger.info(`一级菜单选择失败: ${result.error}`);
+    if (result.debug) {
+      logger.info(`调试信息: ${JSON.stringify(result.debug)}`);
+    }
   }
 }
 

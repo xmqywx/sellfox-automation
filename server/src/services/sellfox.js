@@ -509,84 +509,110 @@ async function selectOrdersByIds(page, orderIds) {
  * @param {Object} page - Playwright page
  */
 async function openBatchAssignChannel(page) {
-  // Click "批量修改" button
-  const batchModifySelectors = [
-    'text=批量修改',
-    'button:has-text("批量修改")',
-    '[class*="batch"]:has-text("修改")',
-  ];
+  // Retry up to 3 times - sometimes the dropdown or menu item needs time to become available
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    logger.info(`尝试打开"批量修改 > 分配渠道" (第${attempt}次)...`);
 
-  for (const selector of batchModifySelectors) {
-    try {
-      const element = await page.$(selector);
-      if (element) {
-        await element.click();
-        await page.waitForTimeout(500);
-        break;
+    // Click "批量修改" button - use hover first then click for el-dropdown
+    const batchModifySelectors = [
+      'text=批量修改',
+      'button:has-text("批量修改")',
+      '[class*="batch"]:has-text("修改")',
+    ];
+
+    for (const selector of batchModifySelectors) {
+      try {
+        const element = await page.$(selector);
+        if (element) {
+          // Hover first to trigger dropdown open, then click
+          await element.hover();
+          await page.waitForTimeout(300);
+          await element.click();
+          await page.waitForTimeout(500);
+          break;
+        }
+      } catch {
+        continue;
       }
-    } catch {
-      continue;
     }
-  }
 
-  // Click "分配渠道" option - using Element UI dropdown menu item
-  await page.waitForTimeout(500);
+    // Wait for dropdown menu to become visible
+    await page.waitForTimeout(800);
 
-  // Try Playwright locator first
-  try {
-    const assignChannelLocator = page.locator('li.el-dropdown-menu__item.dropDownBtnItem').filter({ hasText: '分配渠道' });
-    const count = await assignChannelLocator.count();
-    logger.info(`找到 ${count} 个"分配渠道"菜单项`);
+    // Try to click "分配渠道" - check if it's enabled first
+    let clicked = false;
 
-    if (count > 0) {
-      await assignChannelLocator.first().click({ force: true });
-      logger.info('已点击"分配渠道" (locator方式)');
-      await page.waitForTimeout(1000);
+    try {
+      const assignChannelLocator = page.locator('li.el-dropdown-menu__item.dropDownBtnItem').filter({ hasText: '分配渠道' });
+      const count = await assignChannelLocator.count();
+      logger.info(`找到 ${count} 个"分配渠道"菜单项`);
+
+      if (count > 0) {
+        // Check if the item is disabled
+        const isDisabled = await assignChannelLocator.first().evaluate(el => {
+          return el.classList.contains('is-disabled') || el.getAttribute('aria-disabled') === 'true';
+        });
+
+        if (isDisabled && attempt < 3) {
+          logger.info(`"分配渠道"菜单项已禁用，等待后重试...`);
+          // Click elsewhere to close the dropdown
+          await page.mouse.click(10, 10);
+          await page.waitForTimeout(2000);
+          continue;
+        }
+
+        await assignChannelLocator.first().click({ force: true });
+        logger.info('已点击"分配渠道" (locator方式)');
+        clicked = true;
+      }
+    } catch (e) {
+      logger.info(`Locator方式失败: ${e.message}`);
+    }
+
+    if (!clicked) {
+      // JavaScript fallback - force click even if disabled
+      const jsResult = await page.evaluate(() => {
+        const items = document.querySelectorAll('li.el-dropdown-menu__item, .dropDownBtnItem');
+        for (const item of items) {
+          if (item.textContent.includes('分配渠道')) {
+            // Remove disabled state before clicking
+            item.classList.remove('is-disabled');
+            item.removeAttribute('aria-disabled');
+            item.click();
+            console.log('JS clicked 分配渠道');
+            return true;
+          }
+        }
+        return false;
+      });
+      logger.info(`JS点击"分配渠道": ${jsResult}`);
+    }
+
+    await page.waitForTimeout(1500);
+
+    // Verify dialog opened
+    const dialogOpened = await page.evaluate(() => {
+      const dialog = document.querySelector('.batchDisLogisticsDialog');
+      if (dialog) {
+        const wrapper = dialog.closest('.el-dialog__wrapper');
+        const style = wrapper?.getAttribute('style') || '';
+        return !style.includes('display: none');
+      }
+      return false;
+    });
+
+    if (dialogOpened) {
+      logger.info('批量分配渠道对话框已打开');
       return;
     }
-  } catch (e) {
-    logger.info(`Locator方式失败: ${e.message}`);
-  }
 
-  // Try other selectors
-  const assignChannelSelectors = [
-    'li.el-dropdown-menu__item.dropDownBtnItem:has-text("分配渠道")',
-    'li.el-dropdown-menu__item:has-text("分配渠道")',
-    '.el-dropdown-menu__item:has-text("分配渠道")',
-    '.dropDownBtnItem:has-text("分配渠道")',
-    'text=分配渠道',
-  ];
-
-  for (const selector of assignChannelSelectors) {
-    try {
-      const element = await page.$(selector);
-      if (element) {
-        await element.click();
-        logger.info(`已点击"分配渠道" (${selector})`);
-        await page.waitForTimeout(1000);
-        return;
-      }
-    } catch {
-      continue;
+    if (attempt < 3) {
+      logger.info('对话框未打开，重试...');
+      await page.waitForTimeout(1000);
     }
   }
 
-  // JavaScript fallback
-  await page.evaluate(() => {
-    // Find li with class el-dropdown-menu__item containing "分配渠道"
-    const items = document.querySelectorAll('li.el-dropdown-menu__item, .dropDownBtnItem');
-    for (const item of items) {
-      if (item.textContent.includes('分配渠道')) {
-        item.click();
-        console.log('JS clicked 分配渠道');
-        return true;
-      }
-    }
-    return false;
-  });
-
-  logger.info('已尝试JS点击"分配渠道"');
-  await page.waitForTimeout(1000);
+  logger.info('已完成打开"分配渠道"的所有尝试');
 }
 
 /**
@@ -646,7 +672,17 @@ async function selectWarehouse(page, warehouseName) {
 
   // First, list ALL 批量 buttons with their context for debugging
   const debugInfo = await page.evaluate(() => {
-    const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
+    let dialog = document.querySelector('.batchDisLogisticsDialog');
+    if (!dialog) {
+      const allWrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const wrapper of allWrappers) {
+        const style = wrapper.getAttribute('style') || '';
+        if (!style.includes('display: none') && !style.includes('display:none')) {
+          dialog = wrapper.querySelector('.el-dialog') || wrapper;
+          break;
+        }
+      }
+    }
     if (!dialog) {
       return { hasDialog: false };
     }
@@ -658,20 +694,17 @@ async function selectWarehouse(page, warehouseName) {
     for (let i = 0; i < allButtons.length; i++) {
       const btn = allButtons[i];
       if (btn.textContent.trim() === '批量') {
-        // Get context - find nearest header/label
         const cell = btn.closest('.vxe-cell, .vxe-cell--title, th, td');
         const cellText = cell?.textContent?.replace(/\s+/g, ' ').substring(0, 60) || 'no cell';
-
-        // Check if inside batch_temu_select
         const inBatchTemuSelect = !!btn.closest('.batch_temu_select');
-
-        // Get position
+        const inBatchTemuCascader = !!btn.closest('.batch_temu_cascader');
         const rect = btn.getBoundingClientRect();
 
         batchButtons.push({
           index: i,
           cellText,
           inBatchTemuSelect,
+          inBatchTemuCascader,
           x: Math.round(rect.x),
           y: Math.round(rect.y),
           visible: rect.width > 0 && rect.height > 0
@@ -680,22 +713,22 @@ async function selectWarehouse(page, warehouseName) {
     }
 
     // Find the one specifically next to "店铺仓库" text
-    // Look for the pattern: <span>店铺仓库</span> followed by batch_temu_select
     const storeWarehouseButtons = [];
     const spans = dialog.querySelectorAll('span');
     for (const span of spans) {
       if (span.textContent.trim() === '店铺仓库') {
-        // Look for sibling batch_temu_select
         const parent = span.parentElement;
-        const batchSelect = parent?.querySelector('.batch_temu_select');
-        if (batchSelect) {
-          const btn = batchSelect.querySelector('button');
+        // Look for both batch_temu_select and batch_temu_cascader
+        const batchElement = parent?.querySelector('.batch_temu_select, .batch_temu_cascader');
+        if (batchElement) {
+          const btn = batchElement.querySelector('button');
           if (btn) {
             const rect = btn.getBoundingClientRect();
             storeWarehouseButtons.push({
               spanText: span.textContent,
               parentTag: parent?.tagName,
               buttonText: btn.textContent.trim(),
+              type: batchElement.classList.contains('batch_temu_cascader') ? 'cascader' : 'select',
               x: Math.round(rect.x),
               y: Math.round(rect.y)
             });
@@ -707,7 +740,7 @@ async function selectWarehouse(page, warehouseName) {
     return {
       hasDialog: true,
       totalBatchButtons: batchButtons.length,
-      batchButtons: batchButtons.slice(0, 30), // Show first 30
+      batchButtons: batchButtons.slice(0, 30),
       storeWarehouseButtons
     };
   });
@@ -723,49 +756,67 @@ async function selectWarehouse(page, warehouseName) {
   }
 
   const clickBatchResult = await page.evaluate(() => {
-    // Find the dialog
-    const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
+    // Find the dialog - try specific class first, then generic
+    let dialog = document.querySelector('.batchDisLogisticsDialog');
+    if (!dialog) {
+      // Try finding visible dialog wrapper
+      const allWrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const wrapper of allWrappers) {
+        const style = wrapper.getAttribute('style') || '';
+        if (!style.includes('display: none') && !style.includes('display:none')) {
+          const innerDialog = wrapper.querySelector('.el-dialog');
+          if (innerDialog) {
+            dialog = innerDialog;
+            break;
+          }
+        }
+      }
+    }
     if (!dialog) {
       const allDialogs = document.querySelectorAll('.el-dialog__wrapper');
       return { success: false, error: `未找到对话框 (共${allDialogs.length}个)` };
     }
 
-    // BEST METHOD: Find batch_temu_select with placeholder="选择店铺仓库"
-    // This is the most precise selector based on the HTML structure
+    // Method 0 (BEST for multi-shop): Find batch_temu_cascader in 店铺仓库 column
+    // Multi-shop orders use el-cascader component instead of batch_temu_select
+    const cascaders = dialog.querySelectorAll('.batch_temu_cascader');
+    for (const cascader of cascaders) {
+      const th = cascader.closest('th');
+      if (th && th.textContent.includes('店铺仓库')) {
+        const btn = cascader.querySelector('button');
+        if (btn) {
+          const rect = btn.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            btn.click();
+            return { success: true, message: `已点击店铺仓库批量按钮 (batch_temu_cascader) pos=(${Math.round(rect.x)},${Math.round(rect.y)})`, isCascader: true };
+          }
+        }
+      }
+    }
+
+    // Method 1: Find batch_temu_select with placeholder="选择店铺仓库" (single-shop)
     const batchSelectByPlaceholder = dialog.querySelector('.batch_temu_select[placeholder="选择店铺仓库"]');
     if (batchSelectByPlaceholder) {
-      // IMPORTANT: Click on .popover_trigger, not the button inside
-      // Element UI popover is triggered by clicking the trigger element
       const popoverTrigger = batchSelectByPlaceholder.querySelector('.popover_trigger');
       if (popoverTrigger) {
         const rect = popoverTrigger.getBoundingClientRect();
-        console.log('找到店铺仓库批量按钮 popover_trigger:', rect.x, rect.y);
-
-        // Dispatch multiple events to ensure popover opens
         popoverTrigger.focus();
         popoverTrigger.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
         popoverTrigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
         popoverTrigger.click();
-
         return { success: true, message: `已点击店铺仓库批量按钮 (popover_trigger) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
       }
-
-      // Fallback: click the button
       const btn = batchSelectByPlaceholder.querySelector('button');
       if (btn) {
         const rect = btn.getBoundingClientRect();
-        console.log('找到店铺仓库批量按钮 (placeholder):', rect.x, rect.y);
         btn.click();
         return { success: true, message: `已点击店铺仓库批量按钮 (button fallback) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
       }
     }
 
-    // Method 2: Find batch_temu_select in thead (header row)
-    const theadBatchSelects = dialog.querySelectorAll('thead .batch_temu_select, .vxe-table--header .batch_temu_select');
-    console.log('thead中找到 batch_temu_select 数量:', theadBatchSelects.length);
-
-    for (const bts of theadBatchSelects) {
-      // Check if the column contains "店铺仓库" text
+    // Method 2: Find any batch component (batch_temu_select or batch_temu_cascader) in header with 店铺仓库
+    const headerBatchElements = dialog.querySelectorAll('thead .batch_temu_select, thead .batch_temu_cascader, .vxe-table--header .batch_temu_select, .vxe-table--header .batch_temu_cascader');
+    for (const bts of headerBatchElements) {
       const th = bts.closest('th');
       if (th) {
         const headerText = th.textContent;
@@ -773,45 +824,53 @@ async function selectWarehouse(page, warehouseName) {
           const btn = bts.querySelector('button');
           if (btn) {
             const rect = btn.getBoundingClientRect();
-            btn.click();
-            return { success: true, message: `已点击店铺仓库批量按钮 (thead) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+            if (rect.width > 0 && rect.height > 0) {
+              btn.click();
+              const isCascader = bts.classList.contains('batch_temu_cascader');
+              return { success: true, message: `已点击店铺仓库批量按钮 (thead) pos=(${Math.round(rect.x)},${Math.round(rect.y)})`, isCascader };
+            }
           }
         }
       }
     }
 
-    // Method 3: Find <span>店铺仓库</span> then look for sibling batch_temu_select
+    // Method 3: Find <span>店铺仓库</span> then look for sibling batch component
     const spans = dialog.querySelectorAll('span');
     for (const span of spans) {
       const spanText = span.textContent.trim();
       if (spanText === '店铺仓库') {
-        // Must be in header, not in body row
         const isInHeader = span.closest('thead, .vxe-table--header');
         if (!isInHeader) continue;
 
-        // Look in parent for batch_temu_select
         const parent = span.parentElement;
         if (!parent) continue;
 
-        const batchSelect = parent.querySelector('.batch_temu_select');
-        if (batchSelect) {
-          const btn = batchSelect.querySelector('button');
+        // Look for both batch_temu_select and batch_temu_cascader
+        const batchElement = parent.querySelector('.batch_temu_select, .batch_temu_cascader');
+        if (batchElement) {
+          const btn = batchElement.querySelector('button');
           if (btn) {
             const rect = btn.getBoundingClientRect();
-            btn.click();
-            return { success: true, message: `已点击店铺仓库批量按钮 (span sibling) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+            if (rect.width > 0 && rect.height > 0) {
+              btn.click();
+              const isCascader = batchElement.classList.contains('batch_temu_cascader');
+              return { success: true, message: `已点击店铺仓库批量按钮 (span sibling) pos=(${Math.round(rect.x)},${Math.round(rect.y)})`, isCascader };
+            }
           }
         }
 
         // Also check nextElementSibling
         let sibling = span.nextElementSibling;
         while (sibling) {
-          if (sibling.classList.contains('batch_temu_select')) {
+          if (sibling.classList.contains('batch_temu_select') || sibling.classList.contains('batch_temu_cascader')) {
             const btn = sibling.querySelector('button');
             if (btn) {
               const rect = btn.getBoundingClientRect();
-              btn.click();
-              return { success: true, message: `已点击店铺仓库批量按钮 (nextSibling) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
+              if (rect.width > 0 && rect.height > 0) {
+                btn.click();
+                const isCascader = sibling.classList.contains('batch_temu_cascader');
+                return { success: true, message: `已点击店铺仓库批量按钮 (nextSibling) pos=(${Math.round(rect.x)},${Math.round(rect.y)})`, isCascader };
+              }
             }
           }
           sibling = sibling.nextElementSibling;
@@ -819,41 +878,28 @@ async function selectWarehouse(page, warehouseName) {
       }
     }
 
-    // Method 4: Find all batch_temu_select and check th content
-    const batchTemuSelects = dialog.querySelectorAll('.batch_temu_select');
-    console.log('找到 batch_temu_select 数量:', batchTemuSelects.length);
-
-    for (const bts of batchTemuSelects) {
-      const th = bts.closest('th');
-      if (!th) continue;
-
-      const thText = th.textContent.replace(/\s+/g, ' ').trim();
-      // Must contain "店铺仓库" but NOT other types
-      if (thText.includes('店铺仓库') && !thText.includes('Temu仓库') && !thText.includes('包裹')) {
-        const btn = bts.querySelector('button');
-        if (btn) {
-          const rect = btn.getBoundingClientRect();
-          btn.click();
-          return { success: true, message: `已点击店铺仓库批量按钮 (th check) pos=(${Math.round(rect.x)},${Math.round(rect.y)})` };
-        }
-      }
-    }
-
     // Debug info
-    const batchSelectInfo = Array.from(batchTemuSelects).map(bts => {
-      const th = bts.closest('th');
-      const placeholder = bts.getAttribute('placeholder');
-      return {
-        placeholder,
-        inTh: !!th,
-        thText: th?.textContent?.replace(/\s+/g, ' ').substring(0, 30) || 'no th'
-      };
-    });
+    const batchTemuSelects = dialog.querySelectorAll('.batch_temu_select');
+    const batchTemuCascaders = dialog.querySelectorAll('.batch_temu_cascader');
+    const batchSelectInfo = [
+      ...Array.from(batchTemuSelects).map(bts => ({
+        type: 'select',
+        placeholder: bts.getAttribute('placeholder'),
+        inTh: !!bts.closest('th'),
+        thText: bts.closest('th')?.textContent?.replace(/\s+/g, ' ').substring(0, 30) || 'no th'
+      })),
+      ...Array.from(batchTemuCascaders).map(bts => ({
+        type: 'cascader',
+        inTh: !!bts.closest('th'),
+        thText: bts.closest('th')?.textContent?.replace(/\s+/g, ' ').substring(0, 30) || 'no th'
+      }))
+    ];
 
     return {
       success: false,
       error: '未找到店铺仓库批量按钮',
-      batchTemuSelectCount: batchTemuSelects.length,
+      batchSelectCount: batchTemuSelects.length,
+      batchCascaderCount: batchTemuCascaders.length,
       batchSelectInfo
     };
   });
@@ -868,20 +914,57 @@ async function selectWarehouse(page, warehouseName) {
 
   logger.info(clickBatchResult.message);
 
-  // Also try Playwright's native click as backup - more reliable for Element UI
-  try {
-    const batchTrigger = page.locator('.el-dialog__wrapper:not([style*="display: none"]) .batch_temu_select[placeholder="选择店铺仓库"] .popover_trigger');
-    const count = await batchTrigger.count();
-    if (count > 0) {
-      logger.info('使用 Playwright 原生点击 popover_trigger...');
-      await batchTrigger.first().click({ force: true });
-    }
-  } catch (e) {
-    logger.info(`Playwright点击失败: ${e.message}`);
-  }
+  if (clickBatchResult.isCascader) {
+    // Multi-shop cascader: the JS click already opened the panel.
+    // DO NOT click anything else - it would toggle it off!
+    // Just wait for the cascader panel to render.
+    await page.waitForTimeout(2000);
 
-  // Wait for dropdown to appear (longer wait for Element UI popover)
-  await page.waitForTimeout(2000);
+    // Check if cascader panel is visible
+    const cascaderVisible = await page.evaluate(() => {
+      const menus = document.querySelectorAll('.el-cascader-menu');
+      let visibleCount = 0;
+      for (const menu of menus) {
+        const rect = menu.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) visibleCount++;
+      }
+      // Also check for cascader_panel_wrapper
+      const panelWrapper = document.querySelector('.cascader_panel_wrapper');
+      const panelVisible = panelWrapper && panelWrapper.getBoundingClientRect().width > 0;
+      return { visibleMenus: visibleCount, panelVisible: !!panelVisible };
+    });
+
+    logger.info(`cascader面板状态: 可见菜单=${cascaderVisible.visibleMenus}, 面板可见=${cascaderVisible.panelVisible}`);
+
+    if (cascaderVisible.visibleMenus === 0 && !cascaderVisible.panelVisible) {
+      // Panel didn't open - try clicking the button once more via Playwright
+      logger.info('cascader面板未打开，重新点击批量按钮...');
+      try {
+        const cascaderBtn = page.locator('.batchDisLogisticsDialog .batch_temu_cascader button').first();
+        if (await cascaderBtn.count() > 0) {
+          await cascaderBtn.click({ force: true });
+          await page.waitForTimeout(2000);
+        }
+      } catch (e) {
+        logger.info(`重新点击失败: ${e.message}`);
+      }
+    }
+  } else {
+    // Single-shop: use Playwright backup click on popover trigger
+    try {
+      const batchTrigger = page.locator('.batchDisLogisticsDialog .batch_temu_select[placeholder="选择店铺仓库"] .popover_trigger');
+      const count = await batchTrigger.count();
+      if (count > 0) {
+        logger.info('使用 Playwright 原生点击 popover_trigger...');
+        await batchTrigger.first().click({ force: true });
+      }
+    } catch (e) {
+      logger.info(`Playwright点击失败: ${e.message}`);
+    }
+
+    // Wait for dropdown to appear
+    await page.waitForTimeout(2000);
+  }
 
   // Debug: Check what popovers/menus appeared after clicking
   const popoverDebug = await page.evaluate(() => {
@@ -1285,160 +1368,189 @@ async function handleOneLevelWarehouseMenu(page, menuType = 'one-level') {
 
 /**
  * Handle two-level warehouse menu selection
- * Iterates through each first-level item and selects the first warehouse from each second level
- * IMPORTANT: Must HOVER (not click/select) on first-level items to expand submenu,
- * then select ONLY the first non-"全选" item from the second-level menu
+ * Dynamically detects all first-level items in the cascader panel,
+ * hovers each to expand submenu, then selects the configured warehouse.
+ * Uses warehouseMapping from config for specific selections.
  * @param {Object} page - Playwright page
  */
 async function handleTwoLevelWarehouseMenu(page) {
   logger.info('处理二级仓库菜单...');
 
-  // Known warehouse names (first-level items) - use this list directly
-  // to avoid issues with dynamic rendering or scrolling
-  const validWarehouseNames = ['Bostra', 'SekamInnovation', 'Sekam', 'Atrisec'];
+  // Debug: enumerate ALL cascader-related elements in the entire page
+  const cascaderDebug = await page.evaluate(() => {
+    const results = {
+      cascaderMenus: [],
+      cascaderPanels: [],
+      cascaderDropdowns: [],
+      poppers: []
+    };
 
-  // First, scroll the cascader menu to make sure all items are visible
-  await page.evaluate(() => {
-    const menus = document.querySelectorAll('.el-cascader-menu');
-    for (const menu of menus) {
-      const rect = menu.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        // Scroll to top to ensure all items render
-        menu.scrollTop = 0;
+    // Check all .el-cascader-menu elements
+    document.querySelectorAll('.el-cascader-menu').forEach((el, i) => {
+      const rect = el.getBoundingClientRect();
+      const nodes = el.querySelectorAll('.el-cascader-node');
+      const labels = Array.from(nodes).map(n => n.querySelector('.el-cascader-node__label')?.textContent?.trim() || '').filter(Boolean);
+      results.cascaderMenus.push({
+        index: i,
+        visible: rect.width > 0 && rect.height > 0,
+        rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+        nodeCount: nodes.length,
+        labels: labels.slice(0, 10),
+        parentClass: el.parentElement?.className?.substring(0, 80) || ''
+      });
+    });
+
+    // Check .el-cascader-panel elements
+    document.querySelectorAll('.el-cascader-panel').forEach((el, i) => {
+      const rect = el.getBoundingClientRect();
+      results.cascaderPanels.push({
+        index: i,
+        visible: rect.width > 0 && rect.height > 0,
+        rect: { w: Math.round(rect.width), h: Math.round(rect.height) },
+        menuCount: el.querySelectorAll('.el-cascader-menu').length
+      });
+    });
+
+    // Check .el-popper elements that contain cascader content
+    document.querySelectorAll('.el-popper, .el-cascader__dropdown').forEach((el, i) => {
+      const rect = el.getBoundingClientRect();
+      const hasCascader = el.querySelector('.el-cascader-menu, .el-cascader-panel');
+      if (hasCascader) {
+        const display = window.getComputedStyle(el).display;
+        results.poppers.push({
+          index: i,
+          visible: rect.width > 0 && rect.height > 0,
+          display,
+          rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+          className: el.className.substring(0, 80)
+        });
       }
-    }
+    });
+
+    return results;
   });
 
-  await page.waitForTimeout(500);
+  logger.info(`Cascader调试: menus=${cascaderDebug.cascaderMenus.length}, panels=${cascaderDebug.cascaderPanels.length}, poppers=${cascaderDebug.poppers.length}`);
+  for (const menu of cascaderDebug.cascaderMenus) {
+    logger.info(`  menu[${menu.index}]: visible=${menu.visible} rect=${JSON.stringify(menu.rect)} nodes=${menu.nodeCount} labels=[${menu.labels.join(',')}] parent=${menu.parentClass}`);
+  }
+  for (const panel of cascaderDebug.cascaderPanels) {
+    logger.info(`  panel[${panel.index}]: visible=${panel.visible} rect=${JSON.stringify(panel.rect)} menus=${panel.menuCount}`);
+  }
+  for (const popper of cascaderDebug.poppers) {
+    logger.info(`  popper[${popper.index}]: visible=${popper.visible} display=${popper.display} rect=${JSON.stringify(popper.rect)}`);
+  }
 
-  // Get list of first-level items - search for known warehouse names in the DOM
-  const firstLevelItems = await page.evaluate((warehouseNames) => {
-    // Platform names to EXCLUDE
-    const platformNames = ['Amazon', 'TikTok', 'SHEIN', 'Temu半托管', '无平台标识', 'eBay', 'Shopify', 'Walmart'];
+  // Get first-level items - search ALL cascader menus (including those inside poppers)
+  const firstLevelItems = await page.evaluate(() => {
+    // Find all cascader menus and get the ones that are visible OR have content
+    const allMenus = document.querySelectorAll('.el-cascader-menu');
+    const menusWithContent = [];
 
-    // Find items by searching for known warehouse names
-    const foundItems = [];
-    const allLabels = document.querySelectorAll('.el-cascader-node__label');
-
-    for (const label of allLabels) {
-      const text = label.textContent.trim();
-
-      // Check if this is a known warehouse name
-      if (warehouseNames.includes(text)) {
-        // Verify it's visible
-        const rect = label.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          foundItems.push({ text, hasArrow: true });
-        }
-      }
-    }
-
-    // Deduplicate by text
-    const uniqueItems = [];
-    const seen = new Set();
-    for (const item of foundItems) {
-      if (!seen.has(item.text)) {
-        seen.add(item.text);
-        uniqueItems.push(item);
-      }
-    }
-
-    // If we found known warehouse names, use them
-    if (uniqueItems.length > 0) {
-      console.log('Found warehouse items by name:', uniqueItems.map(i => i.text));
-      return uniqueItems;
-    }
-
-    // Fallback: scan visible menus for any non-platform items
-    const cascaderMenus = document.querySelectorAll('.el-cascader-menu');
-    const visibleMenus = Array.from(cascaderMenus)
-      .map(menu => ({
-        menu,
-        rect: menu.getBoundingClientRect()
-      }))
-      .filter(m => m.rect.width > 0 && m.rect.height > 0)
-      .sort((a, b) => a.rect.left - b.rect.left);
-
-    for (const { menu } of visibleMenus) {
+    for (const menu of allMenus) {
       const nodes = menu.querySelectorAll('.el-cascader-node');
-      const menuItems = [];
-      let hasPlatformItem = false;
+      if (nodes.length === 0) continue;
 
-      for (const node of nodes) {
-        const label = node.querySelector('.el-cascader-node__label');
-        if (!label) continue;
+      const rect = menu.getBoundingClientRect();
+      // Include menus that are visible OR inside a visible parent
+      const parentPopper = menu.closest('.el-popper, .el-cascader__dropdown, .el-cascader-panel');
+      const parentRect = parentPopper?.getBoundingClientRect();
+      const isInVisibleParent = parentRect && parentRect.width > 0 && parentRect.height > 0;
+      const isVisible = rect.width > 0 && rect.height > 0;
 
-        const text = label.textContent.trim();
-        if (!text || text === '全选') continue;
-
-        if (platformNames.includes(text)) {
-          hasPlatformItem = true;
-        } else {
-          menuItems.push({ text, hasArrow: true });
-        }
-      }
-
-      if (!hasPlatformItem && menuItems.length > 0) {
-        console.log('Found warehouse menu (fallback):', menuItems.map(i => i.text));
-        return menuItems;
+      if (isVisible || isInVisibleParent) {
+        menusWithContent.push({
+          menu,
+          rect,
+          x: isVisible ? rect.left : (parentRect?.left || 0),
+          nodeCount: nodes.length,
+          isVisible
+        });
       }
     }
 
-    return [];
-  }, validWarehouseNames);
+    // Sort by X position (leftmost = first level)
+    menusWithContent.sort((a, b) => a.x - b.x);
 
-  const itemNames = firstLevelItems.map(i => i.text);
-  logger.info(`找到 ${firstLevelItems.length} 个一级菜单项: ${itemNames.join(', ')}`);
+    if (menusWithContent.length === 0) {
+      return { items: [], debug: 'no visible menus found' };
+    }
+
+    // Use the first menu (leftmost) as first-level
+    const firstMenu = menusWithContent[0].menu;
+    const nodes = firstMenu.querySelectorAll('.el-cascader-node');
+    const items = [];
+
+    for (const node of nodes) {
+      const label = node.querySelector('.el-cascader-node__label');
+      if (!label) continue;
+
+      const text = label.textContent.trim();
+      if (!text || text === '全选') continue;
+
+      items.push({ text });
+    }
+
+    // Deduplicate
+    const seen = new Set();
+    const unique = items.filter(item => {
+      if (seen.has(item.text)) return false;
+      seen.add(item.text);
+      return true;
+    });
+
+    return {
+      items: unique,
+      debug: `found ${menusWithContent.length} menus, first has ${nodes.length} nodes`
+    };
+  });
+
+  const itemNames = firstLevelItems.items.map(i => i.text);
+  logger.info(`找到 ${firstLevelItems.items.length} 个一级菜单项: ${itemNames.join(', ')} (${firstLevelItems.debug})`);
 
   // If no items found, try alternative selection method
-  if (firstLevelItems.length === 0) {
+  if (firstLevelItems.items.length === 0) {
     logger.info('尝试备用选择方法...');
     await handleWarehouseSelectionFallback(page);
     return;
   }
 
   // Process each first-level item
-  for (const item of firstLevelItems) {
+  for (const item of firstLevelItems.items) {
     const itemName = item.text;
-    logger.info(`处理一级菜单: ${itemName}`);
+    logger.info(`处理一级菜单: ${itemName} → 选第一个仓库`);
 
-    // Find the cascader node element and hover on it using JavaScript
-    // This is more reliable than Playwright's hover for Element UI components
+    // Hover on the first-level item to expand its submenu
     const hoverResult = await page.evaluate((name) => {
-      // Find the cascader node with matching label text
       const allNodes = document.querySelectorAll('.el-cascader-node');
       for (const node of allNodes) {
         const label = node.querySelector('.el-cascader-node__label');
-        if (label && label.textContent.trim() === name) {
-          const rect = node.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) continue;
+        if (!label || label.textContent.trim() !== name) continue;
 
-          // Trigger multiple hover events to ensure submenu expands
-          const events = ['mouseenter', 'mouseover', 'mousemove'];
-          for (const eventType of events) {
-            node.dispatchEvent(new MouseEvent(eventType, {
-              bubbles: true,
-              cancelable: true,
-              view: window,
-              clientX: rect.left + rect.width / 2,
-              clientY: rect.top + rect.height / 2
-            }));
-          }
+        const rect = node.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
 
-          // Also trigger on the label itself
-          const labelRect = label.getBoundingClientRect();
-          for (const eventType of events) {
-            label.dispatchEvent(new MouseEvent(eventType, {
-              bubbles: true,
-              cancelable: true,
-              view: window,
-              clientX: labelRect.left + labelRect.width / 2,
-              clientY: labelRect.top + labelRect.height / 2
-            }));
-          }
-
-          return { success: true, nodeRect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height } };
+        // Trigger hover events on the node
+        const events = ['mouseenter', 'mouseover', 'mousemove'];
+        for (const eventType of events) {
+          node.dispatchEvent(new MouseEvent(eventType, {
+            bubbles: true, cancelable: true, view: window,
+            clientX: rect.left + rect.width / 2,
+            clientY: rect.top + rect.height / 2
+          }));
         }
+
+        // Also trigger on the label
+        const labelRect = label.getBoundingClientRect();
+        for (const eventType of events) {
+          label.dispatchEvent(new MouseEvent(eventType, {
+            bubbles: true, cancelable: true, view: window,
+            clientX: labelRect.left + labelRect.width / 2,
+            clientY: labelRect.top + labelRect.height / 2
+          }));
+        }
+
+        return { success: true, nodeRect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height } };
       }
       return { success: false, error: '未找到匹配的cascader节点' };
     }, itemName);
@@ -1449,24 +1561,21 @@ async function handleTwoLevelWarehouseMenu(page) {
     }
     logger.info(`已hover到一级菜单: ${itemName}`);
 
-    // Also use Playwright's mouse to move to the element position for better reliability
+    // Also use Playwright mouse for more reliable hover
     try {
-      const nodeRect = hoverResult.nodeRect;
-      await page.mouse.move(nodeRect.x + nodeRect.w / 2, nodeRect.y + nodeRect.h / 2);
-    } catch (e) {
-      // Ignore mouse move errors
-    }
+      const nr = hoverResult.nodeRect;
+      await page.mouse.move(nr.x + nr.w / 2, nr.y + nr.h / 2);
+    } catch (e) { /* ignore */ }
 
-    // Wait for submenu to appear (longer wait for reliability)
+    // Wait for submenu to appear
     await page.waitForTimeout(1000);
 
-    // Select the first option after "全选" in the second level submenu
-    const selectResult = await page.evaluate((parentName) => {
-      // First-level items (parent names) should NOT appear in second-level
-      const firstLevelNames = ['Bostra', 'SekamInnovation', 'Sekam', 'Atrisec'];
-      const platformNames = ['Amazon', 'TikTok', 'SHEIN', 'Temu半托管', '无平台标识', 'eBay', 'Shopify', 'Walmart'];
+    // Select the first non-全选 item in the second-level submenu
+    const selectArgs = { parentName: itemName, allParentNames: itemNames };
+    const selectResult = await page.evaluate((args) => {
+      const { parentName, allParentNames } = args;
 
-      // Find all visible cascader menus and their positions
+      // Find all visible cascader menus
       const cascaderMenus = document.querySelectorAll('.el-cascader-menu');
       const visibleMenus = [];
 
@@ -1477,19 +1586,14 @@ async function handleTwoLevelWarehouseMenu(page) {
         }
       }
 
-      // Sort by X position to find the rightmost one (submenu)
-      visibleMenus.sort((a, b) => b.x - a.x);
+      visibleMenus.sort((a, b) => b.x - a.x); // rightmost first
 
       if (visibleMenus.length < 2) {
-        // Log what menus we found for debugging
-        const menuInfo = visibleMenus.map(m => `x=${m.x}`).join(', ');
-        return { success: false, error: `二级菜单未显示 (仅找到 ${visibleMenus.length} 个菜单: ${menuInfo})` };
+        return { success: false, error: `二级菜单未显示 (可见菜单数: ${visibleMenus.length})` };
       }
 
       // The rightmost menu is the submenu
       const submenu = visibleMenus[0].menu;
-
-      // Get all items in submenu for debugging
       const submenuNodes = submenu.querySelectorAll('.el-cascader-node');
       const allItems = [];
 
@@ -1500,38 +1604,28 @@ async function handleTwoLevelWarehouseMenu(page) {
         const text = label.textContent.trim();
         allItems.push(text);
 
-        // Skip "全选"
-        if (text === '全选') continue;
+        // Skip 全选 and parent-level names
+        if (text === '全选' || allParentNames.includes(text)) continue;
 
-        // Skip first-level names
-        if (firstLevelNames.includes(text)) continue;
+        // Click the first valid item's checkbox
+        const inner = node.querySelector('.el-checkbox__inner');
+        const input = node.querySelector('.el-checkbox__input');
 
-        // Skip platform names
-        if (platformNames.includes(text)) continue;
-
-        // Find and click the checkbox
-        const checkboxInner = node.querySelector('.el-checkbox__inner');
-        const checkboxInput = node.querySelector('.el-checkbox__input');
-        const anyCheckbox = node.querySelector('[class*="checkbox"]');
-
-        if (checkboxInner) {
-          checkboxInner.click();
+        if (inner) {
+          inner.click();
           return { success: true, selected: text, parent: parentName };
-        } else if (checkboxInput) {
-          checkboxInput.click();
-          return { success: true, selected: text, parent: parentName };
-        } else if (anyCheckbox) {
-          anyCheckbox.click();
+        } else if (input) {
+          input.click();
           return { success: true, selected: text, parent: parentName };
         }
+
+        // Try clicking the node itself
+        node.click();
+        return { success: true, selected: text, parent: parentName, method: 'node_click' };
       }
 
-      return {
-        success: false,
-        error: `${parentName} 的二级菜单中未找到可选项`,
-        submenuItems: allItems
-      };
-    }, itemName);
+      return { success: false, error: `${parentName} 的二级菜单中未找到可选项`, submenuItems: allItems };
+    }, selectArgs);
 
     if (selectResult.success) {
       logger.info(`已选择: ${selectResult.parent} > ${selectResult.selected}`);
@@ -1542,52 +1636,117 @@ async function handleTwoLevelWarehouseMenu(page) {
       }
     }
 
-    // Small delay before processing next item
     await page.waitForTimeout(500);
   }
 }
 
 /**
  * Fallback warehouse selection when standard cascader detection fails
+ * Strategy: Find all visible cascader nodes and try to select appropriate warehouses.
+ * First tries clicking "全选" in each menu, then falls back to clicking first available item.
  * @param {Object} page - Playwright page
  */
 async function handleWarehouseSelectionFallback(page) {
   logger.info('使用备用方法选择仓库...');
 
-  // Try to find and click any visible checkbox that's not "全选"
-  const result = await page.evaluate(() => {
-    const selected = [];
-
-    // Find all checkbox labels in cascader menus
+  // Debug: log all visible cascader content
+  const debugResult = await page.evaluate(() => {
     const menus = document.querySelectorAll('.el-cascader-menu');
-
+    const menuInfo = [];
     for (const menu of menus) {
+      const rect = menu.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
       const nodes = menu.querySelectorAll('.el-cascader-node');
-
+      const items = [];
       for (const node of nodes) {
         const label = node.querySelector('.el-cascader-node__label');
-        if (!label) continue;
-
-        const text = label.textContent.trim();
-        if (text === '全选') continue;
-
-        // Check if this node has a checkbox
         const checkbox = node.querySelector('.el-checkbox__input');
-        if (checkbox && !checkbox.classList.contains('is-checked')) {
-          checkbox.click();
-          selected.push(text);
-          break; // Only select first available in each menu
+        items.push({
+          text: label?.textContent?.trim() || '',
+          hasCheckbox: !!checkbox,
+          isChecked: checkbox?.classList.contains('is-checked') || false,
+          hasArrow: !!node.querySelector('.el-icon-arrow-right, .el-cascader-node__postfix')
+        });
+      }
+      menuInfo.push({ x: Math.round(rect.left), items });
+    }
+    return menuInfo;
+  });
+
+  logger.info(`备用方法 - 找到 ${debugResult.length} 个可见cascader菜单`);
+  for (const menu of debugResult) {
+    const itemList = menu.items.map(i => `${i.text}(cb=${i.hasCheckbox},chk=${i.isChecked},arr=${i.hasArrow})`).join(', ');
+    logger.info(`菜单 x=${menu.x}: ${itemList}`);
+  }
+
+  // Strategy: Try to click "全选" in the leftmost menu (select all first-level items)
+  const result = await page.evaluate(() => {
+    const menus = document.querySelectorAll('.el-cascader-menu');
+    const visibleMenus = Array.from(menus)
+      .filter(m => {
+        const rect = m.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      })
+      .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+
+    if (visibleMenus.length === 0) {
+      return { success: false, error: '未找到可见的cascader菜单' };
+    }
+
+    const selected = [];
+
+    // Try clicking "全选" checkbox in the first (leftmost) menu
+    for (const menu of visibleMenus) {
+      const nodes = menu.querySelectorAll('.el-cascader-node');
+      for (const node of nodes) {
+        const label = node.querySelector('.el-cascader-node__label');
+        const text = label?.textContent?.trim() || '';
+
+        if (text === '全选') {
+          const checkbox = node.querySelector('.el-checkbox__input');
+          if (checkbox && !checkbox.classList.contains('is-checked')) {
+            const inner = node.querySelector('.el-checkbox__inner');
+            if (inner) {
+              inner.click();
+              selected.push('全选');
+              return { success: true, selected, method: '全选' };
+            }
+            checkbox.click();
+            selected.push('全选');
+            return { success: true, selected, method: '全选' };
+          }
         }
       }
     }
 
-    return { success: selected.length > 0, selected };
+    // If no "全选", click each non-checked item in the first menu
+    const firstMenu = visibleMenus[0];
+    const nodes = firstMenu.querySelectorAll('.el-cascader-node');
+    for (const node of nodes) {
+      const label = node.querySelector('.el-cascader-node__label');
+      const text = label?.textContent?.trim() || '';
+      if (!text || text === '全选') continue;
+
+      const checkbox = node.querySelector('.el-checkbox__input');
+      if (checkbox && !checkbox.classList.contains('is-checked')) {
+        const inner = node.querySelector('.el-checkbox__inner');
+        if (inner) {
+          inner.click();
+          selected.push(text);
+        } else {
+          checkbox.click();
+          selected.push(text);
+        }
+      }
+    }
+
+    return { success: selected.length > 0, selected, method: '逐项选择' };
   });
 
   if (result.success) {
-    logger.info(`备用方法已选择: ${result.selected.join(', ')}`);
+    logger.info(`备用方法已选择 (${result.method}): ${result.selected.join(', ')}`);
   } else {
-    logger.info('备用方法未能选择任何仓库');
+    logger.info(`备用方法未能选择任何仓库: ${result.error || '无可选项'}`);
   }
 }
 
@@ -1671,53 +1830,86 @@ async function clickAutoCompare(page) {
  * @param {Object} page - Playwright page
  */
 async function waitForAutoCompareComplete(page) {
-  const maxWaitTime = 60000; // 60 seconds max
-  const checkInterval = 1000; // Check every 1 second
+  const maxWaitTime = 120000; // 120 seconds max (比价请求可能很慢)
+  const checkInterval = 2000; // Check every 2 seconds
   let elapsed = 0;
+  let loadingDetected = false;
+
+  // Phase 1: Wait for loading to START (give the request time to initiate)
+  logger.info('等待比价请求开始...');
+  const phase1Max = 10000; // 10 seconds to detect loading
+  let phase1Elapsed = 0;
+
+  while (phase1Elapsed < phase1Max) {
+    await page.waitForTimeout(1000);
+    phase1Elapsed += 1000;
+    elapsed += 1000;
+
+    const isLoading = await page.evaluate(() => {
+      const dialog = document.querySelector('.batchDisLogisticsDialog') || document;
+
+      // Check all possible loading indicators
+      const loadingMask = dialog.querySelector('.el-loading-mask');
+      const maskVisible = loadingMask && window.getComputedStyle(loadingMask).display !== 'none';
+
+      const vxeLoading = dialog.querySelector('.vxe-table--loading');
+      const vxeVisible = vxeLoading && window.getComputedStyle(vxeLoading).display !== 'none';
+
+      // Check for spinning/loading class
+      const spinning = dialog.querySelector('.el-loading-spinner, .is-loading, [class*="loading"]');
+      const spinVisible = spinning && spinning.offsetParent !== null;
+
+      return maskVisible || vxeVisible || spinVisible;
+    });
+
+    if (isLoading) {
+      loadingDetected = true;
+      logger.info(`检测到比价加载中 (${phase1Elapsed / 1000}秒)`);
+      break;
+    }
+  }
+
+  if (!loadingDetected) {
+    logger.info('未检测到加载状态，可能比价已完成或未触发，等待5秒后继续...');
+    await page.waitForTimeout(5000);
+    return;
+  }
+
+  // Phase 2: Wait for loading to FINISH
+  logger.info('等待比价完成...');
 
   while (elapsed < maxWaitTime) {
     await page.waitForTimeout(checkInterval);
     elapsed += checkInterval;
 
-    // Check if loading indicator is gone and data is loaded
-    const status = await page.evaluate(() => {
-      // Check for loading indicators
-      const loadingSpinner = document.querySelector('.el-loading-mask:not([style*="display: none"]), .vxe-table--loading:not([style*="display: none"])');
-      const isLoading = loadingSpinner && loadingSpinner.offsetParent !== null;
+    const isStillLoading = await page.evaluate(() => {
+      const dialog = document.querySelector('.batchDisLogisticsDialog') || document;
 
-      // Check if table has data in "物流比价" or "发货渠道" columns
-      const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
-      if (!dialog) return { loading: false, hasData: false, error: '对话框未找到' };
+      const loadingMask = dialog.querySelector('.el-loading-mask');
+      const maskVisible = loadingMask && window.getComputedStyle(loadingMask).display !== 'none';
 
-      // Look for cells with actual logistics data (not placeholder text)
-      const cells = dialog.querySelectorAll('.vxe-body--column');
-      let hasLogisticsData = false;
-      for (const cell of cells) {
-        const text = cell.textContent.trim();
-        // Check if cell contains actual logistics info (price, time, etc.)
-        if (text.includes('￥') || text.includes('元') || text.includes('天') || text.includes('h')) {
-          hasLogisticsData = true;
-          break;
-        }
-      }
+      const vxeLoading = dialog.querySelector('.vxe-table--loading');
+      const vxeVisible = vxeLoading && window.getComputedStyle(vxeLoading).display !== 'none';
 
-      return {
-        loading: isLoading,
-        hasData: hasLogisticsData
-      };
+      const spinning = dialog.querySelector('.el-loading-spinner, .is-loading');
+      const spinVisible = spinning && spinning.offsetParent !== null;
+
+      return maskVisible || vxeVisible || spinVisible;
     });
 
-    if (!status.loading && status.hasData) {
+    if (!isStillLoading) {
       logger.info(`自动比价完成 (耗时: ${elapsed / 1000}秒)`);
+      // Extra wait for UI to settle
+      await page.waitForTimeout(1000);
       return;
     }
 
-    if (elapsed % 5000 === 0) {
-      logger.info(`等待自动比价... (${elapsed / 1000}秒, loading=${status.loading}, hasData=${status.hasData})`);
+    if (elapsed % 10000 === 0) {
+      logger.info(`比价仍在进行中... (${elapsed / 1000}秒)`);
     }
   }
 
-  logger.info('自动比价等待超时，继续执行...');
+  logger.info(`自动比价等待超时 (${maxWaitTime / 1000}秒)，继续执行...`);
 }
 
 /**
@@ -1730,7 +1922,18 @@ async function clickSaveButton(page) {
   await page.waitForTimeout(500);
 
   const clickResult = await page.evaluate(() => {
-    const dialog = document.querySelector('.el-dialog__wrapper:not([style*="display: none"])');
+    // Try .batchDisLogisticsDialog first, then fall back to any visible dialog
+    let dialog = document.querySelector('.batchDisLogisticsDialog');
+    if (!dialog) {
+      const allWrappers = document.querySelectorAll('.el-dialog__wrapper');
+      for (const wrapper of allWrappers) {
+        const style = wrapper.getAttribute('style') || '';
+        if (!style.includes('display: none') && !style.includes('display:none')) {
+          dialog = wrapper;
+          break;
+        }
+      }
+    }
     if (!dialog) {
       return { success: false, error: '对话框未找到' };
     }
@@ -1775,7 +1978,7 @@ async function clickSaveButton(page) {
 
     // Try Playwright locator as fallback
     try {
-      const saveBtn = page.locator('.el-dialog__footer button.el-button--primary:has-text("保存")').first();
+      const saveBtn = page.locator('.batchDisLogisticsDialog .el-dialog__footer button.el-button--primary:has-text("保存")').first();
       await saveBtn.click({ force: true });
       logger.info('已点击"保存"按钮 (Playwright)');
     } catch (e) {
@@ -1804,7 +2007,7 @@ export async function runAutomation(orderIds, warehouseName) {
   }
 
   const config = loadConfig();
-  const totalSteps = 8;
+  const totalSteps = 7;
 
   updateAutomationState({
     status: 'running',
@@ -1822,12 +2025,7 @@ export async function runAutomation(orderIds, warehouseName) {
       await navigateToOrderShipPage(page);
     });
 
-    // Step 2: Click unassigned channel tab
-    await executeStep('点击"未分配渠道"标签', async () => {
-      await clickUnassignedChannelTab(page);
-    });
-
-    // Step 3: Select orders by checkbox
+    // Step 2: Select orders by checkbox (跳过"未分配渠道"标签点击)
     await executeStep(`选择订单 (共 ${orderIds.length} 个)`, async () => {
       const result = await selectOrdersByIds(page, orderIds);
       emitEvent('log', {

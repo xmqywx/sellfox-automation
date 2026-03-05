@@ -4,12 +4,11 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 function getWebSocketUrl() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.host;
+  const url = `${protocol}//${host}/ws`;
 
-  // Log for debugging
-  console.log('[WebSocket] Page location:', window.location.href);
-  console.log('[WebSocket] Connecting to:', `${protocol}//${host}`);
+  console.log('[WebSocket] Connecting to:', url);
 
-  return `${protocol}//${host}`;
+  return url;
 }
 
 function useWebSocket() {

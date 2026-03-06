@@ -92,13 +92,24 @@ export async function connectToChrome(port = 9222) {
         }
       }
 
-      // Otherwise use first page
+      // Otherwise use first non-internal page (skip chrome:// pages)
       if (!selectedPage && pages.length > 0) {
-        selectedPage = pages[0];
-        try {
-          logger.info(`使用第一个页面: ${selectedPage.url()}`);
-        } catch {
-          logger.info(`使用第一个页面 (URL不可用)`);
+        for (const p of pages) {
+          try {
+            const url = p.url();
+            if (url && !url.startsWith('chrome://') && !url.startsWith('devtools://') && !url.startsWith('about:')) {
+              selectedPage = p;
+              logger.info(`使用非内部页面: ${url}`);
+              break;
+            }
+          } catch {
+            continue;
+          }
+        }
+        // If all pages are internal, use the last one (most likely the real tab)
+        if (!selectedPage) {
+          selectedPage = pages[pages.length - 1];
+          logger.info(`所有页面都是内部页面，使用最后一个页面`);
         }
       }
 
@@ -247,6 +258,7 @@ export async function takeScreenshot() {
       type: 'jpeg',
       quality: 60,
       fullPage: false,
+      timeout: 5000,
     });
     return buffer.toString('base64');
   } catch (error) {
@@ -262,11 +274,18 @@ export async function takeScreenshot() {
 export function startScreenshotCapture(interval = 1000) {
   stopScreenshotCapture();
 
+  let taking = false;
   screenshotInterval = setInterval(async () => {
+    if (taking) return; // Skip if previous screenshot still in progress
     if (isConnected() && page) {
-      const screenshot = await takeScreenshot();
-      if (screenshot) {
-        emitEvent('screenshot', { image: screenshot, timestamp: Date.now() });
+      taking = true;
+      try {
+        const screenshot = await takeScreenshot();
+        if (screenshot) {
+          emitEvent('screenshot', { image: screenshot, timestamp: Date.now() });
+        }
+      } finally {
+        taking = false;
       }
     }
   }, interval);

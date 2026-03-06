@@ -1760,6 +1760,9 @@ async function clickAutoCompare(page) {
   // Wait for page to stabilize
   await page.waitForTimeout(1000);
 
+  // Start Playwright network tracker BEFORE clicking so we catch all requests
+  const tracker = startNetworkTracker(page);
+
   // Find and click the VISIBLE "自动比价" button using JavaScript
   // This is more reliable because we can check visibility before clicking
   const clickResult = await page.evaluate(() => {
@@ -1822,85 +1825,98 @@ async function clickAutoCompare(page) {
 
   // Wait for auto compare to complete
   logger.info('等待自动比价完成...');
-  await waitForAutoCompareComplete(page);
+  await waitForAutoCompareComplete(page, tracker);
 }
 
 /**
  * Wait for auto compare request to complete
  * @param {Object} page - Playwright page
  */
-async function waitForAutoCompareComplete(page) {
-  const maxWaitTime = 120000; // 120 seconds max (比价请求可能很慢)
-  const checkInterval = 2000; // Check every 2 seconds
+/**
+ * Start Playwright-level network request tracking (non-invasive, no page injection)
+ * @param {Object} page - Playwright page
+ * @returns {Object} tracker object with pending/total counts
+ */
+function startNetworkTracker(page) {
+  const tracker = {
+    pending: 0,
+    total: 0,
+    lastResponseTime: 0,
+    onRequest: null,
+    onResponse: null,
+    onRequestFailed: null,
+  };
+
+  tracker.onRequest = (request) => {
+    tracker.pending++;
+    tracker.total++;
+  };
+
+  tracker.onResponse = (response) => {
+    tracker.pending = Math.max(0, tracker.pending - 1);
+    tracker.lastResponseTime = Date.now();
+  };
+
+  tracker.onRequestFailed = (request) => {
+    tracker.pending = Math.max(0, tracker.pending - 1);
+    tracker.lastResponseTime = Date.now();
+  };
+
+  page.on('request', tracker.onRequest);
+  page.on('response', tracker.onResponse);
+  page.on('requestfailed', tracker.onRequestFailed);
+
+  return tracker;
+}
+
+function stopNetworkTracker(page, tracker) {
+  if (tracker.onRequest) page.removeListener('request', tracker.onRequest);
+  if (tracker.onResponse) page.removeListener('response', tracker.onResponse);
+  if (tracker.onRequestFailed) page.removeListener('requestfailed', tracker.onRequestFailed);
+}
+
+async function waitForAutoCompareComplete(page, tracker) {
+  const maxWaitTime = 120000; // 120 seconds max
+  const checkInterval = 2000;
   let elapsed = 0;
-  let loadingDetected = false;
 
-  // Phase 1: Wait for loading to START (give the request time to initiate)
-  logger.info('等待比价请求开始...');
-  const phase1Max = 10000; // 10 seconds to detect loading
-  let phase1Elapsed = 0;
+  // Phase 1: Wait for at least one request to fire (up to 10 seconds)
+  logger.info('等待比价请求发出...');
+  const phase1Max = 10000;
 
-  while (phase1Elapsed < phase1Max) {
+  while (elapsed < phase1Max) {
     await page.waitForTimeout(1000);
-    phase1Elapsed += 1000;
     elapsed += 1000;
 
-    const isLoading = await page.evaluate(() => {
-      const dialog = document.querySelector('.batchDisLogisticsDialog') || document;
-
-      // Check all possible loading indicators
-      const loadingMask = dialog.querySelector('.el-loading-mask');
-      const maskVisible = loadingMask && window.getComputedStyle(loadingMask).display !== 'none';
-
-      const vxeLoading = dialog.querySelector('.vxe-table--loading');
-      const vxeVisible = vxeLoading && window.getComputedStyle(vxeLoading).display !== 'none';
-
-      // Check for spinning/loading class
-      const spinning = dialog.querySelector('.el-loading-spinner, .is-loading, [class*="loading"]');
-      const spinVisible = spinning && spinning.offsetParent !== null;
-
-      return maskVisible || vxeVisible || spinVisible;
-    });
-
-    if (isLoading) {
-      loadingDetected = true;
-      logger.info(`检测到比价加载中 (${phase1Elapsed / 1000}秒)`);
+    if (tracker.total > 0) {
+      logger.info(`检测到比价请求已发出 (total=${tracker.total}, pending=${tracker.pending}, ${elapsed / 1000}秒)`);
       break;
     }
   }
 
-  if (!loadingDetected) {
-    logger.info('未检测到加载状态，可能比价已完成或未触发，等待5秒后继续...');
+  if (tracker.total === 0) {
+    logger.info('未检测到请求，等待5秒后继续...');
     await page.waitForTimeout(5000);
+    stopNetworkTracker(page, tracker);
     return;
   }
 
-  // Phase 2: Wait for loading to FINISH
-  logger.info('等待比价完成...');
+  // Phase 2: Wait for all requests to complete
+  logger.info('等待比价请求完成...');
 
   while (elapsed < maxWaitTime) {
     await page.waitForTimeout(checkInterval);
     elapsed += checkInterval;
 
-    const isStillLoading = await page.evaluate(() => {
-      const dialog = document.querySelector('.batchDisLogisticsDialog') || document;
+    const idleMs = tracker.lastResponseTime > 0 ? Date.now() - tracker.lastResponseTime : 0;
 
-      const loadingMask = dialog.querySelector('.el-loading-mask');
-      const maskVisible = loadingMask && window.getComputedStyle(loadingMask).display !== 'none';
+    logger.info(`比价状态: pending=${tracker.pending}, total=${tracker.total}, idle=${idleMs}ms (${elapsed / 1000}秒)`);
 
-      const vxeLoading = dialog.querySelector('.vxe-table--loading');
-      const vxeVisible = vxeLoading && window.getComputedStyle(vxeLoading).display !== 'none';
-
-      const spinning = dialog.querySelector('.el-loading-spinner, .is-loading');
-      const spinVisible = spinning && spinning.offsetParent !== null;
-
-      return maskVisible || vxeVisible || spinVisible;
-    });
-
-    if (!isStillLoading) {
-      logger.info(`自动比价完成 (耗时: ${elapsed / 1000}秒)`);
-      // Extra wait for UI to settle
-      await page.waitForTimeout(1000);
+    // Complete when: no pending requests AND idle for 3+ seconds
+    if (tracker.pending === 0 && idleMs >= 3000) {
+      logger.info(`自动比价完成 (耗时: ${elapsed / 1000}秒, 共${tracker.total}个请求)`);
+      stopNetworkTracker(page, tracker);
+      await page.waitForTimeout(1000); // UI settle
       return;
     }
 
@@ -1910,6 +1926,7 @@ async function waitForAutoCompareComplete(page) {
   }
 
   logger.info(`自动比价等待超时 (${maxWaitTime / 1000}秒)，继续执行...`);
+  stopNetworkTracker(page, tracker);
 }
 
 /**
@@ -1917,12 +1934,11 @@ async function waitForAutoCompareComplete(page) {
  * @param {Object} page - Playwright page
  */
 async function clickSaveButton(page) {
-  logger.info('准备点击"保存"按钮...');
+  logger.info('准备点击"保存并下单"按钮...');
 
   await page.waitForTimeout(500);
 
   const clickResult = await page.evaluate(() => {
-    // Try .batchDisLogisticsDialog first, then fall back to any visible dialog
     let dialog = document.querySelector('.batchDisLogisticsDialog');
     if (!dialog) {
       const allWrappers = document.querySelectorAll('.el-dialog__wrapper');
@@ -1938,49 +1954,38 @@ async function clickSaveButton(page) {
       return { success: false, error: '对话框未找到' };
     }
 
-    // Find the footer section
     const footer = dialog.querySelector('.el-dialog__footer');
     if (!footer) {
       return { success: false, error: '对话框footer未找到' };
     }
 
-    // Find the primary "保存" button (not "保存并下单")
+    // Find "保存并下单" button
     const buttons = footer.querySelectorAll('button');
     for (const btn of buttons) {
       const text = btn.textContent.trim().replace(/\s+/g, '');
-      // Match "保存" but not "保存并下单"
-      if (text === '保存' && btn.classList.contains('el-button--primary')) {
+      if (text === '保存并下单') {
         btn.click();
-        return { success: true, message: '已点击"保存"按钮' };
-      }
-    }
-
-    // Fallback: find any primary button with "保存"
-    for (const btn of buttons) {
-      const text = btn.textContent.trim();
-      if (text.includes('保') && text.includes('存') && !text.includes('下单')) {
-        btn.click();
-        return { success: true, message: '已点击"保存"按钮 (fallback)' };
+        return { success: true, message: '已点击"保存并下单"按钮' };
       }
     }
 
     const buttonTexts = Array.from(buttons).map(b => b.textContent.trim());
-    return { success: false, error: '未找到保存按钮', buttons: buttonTexts };
+    return { success: false, error: '未找到"保存并下单"按钮', buttons: buttonTexts };
   });
 
   if (clickResult.success) {
     logger.info(clickResult.message);
   } else {
-    logger.info(`保存按钮点击失败: ${clickResult.error}`);
+    logger.info(`"保存并下单"按钮点击失败: ${clickResult.error}`);
     if (clickResult.buttons) {
       logger.info(`可用按钮: ${clickResult.buttons.join(', ')}`);
     }
 
     // Try Playwright locator as fallback
     try {
-      const saveBtn = page.locator('.batchDisLogisticsDialog .el-dialog__footer button.el-button--primary:has-text("保存")').first();
+      const saveBtn = page.locator('.batchDisLogisticsDialog .el-dialog__footer button:has-text("保存并下单")').first();
       await saveBtn.click({ force: true });
-      logger.info('已点击"保存"按钮 (Playwright)');
+      logger.info('已点击"保存并下单"按钮 (Playwright)');
     } catch (e) {
       logger.info(`Playwright点击失败: ${e.message}`);
     }
@@ -2064,7 +2069,7 @@ export async function runAutomation(orderIds, warehouseName) {
     });
 
     // Step 8: Click save button
-    await executeStep('点击"保存"按钮', async () => {
+    await executeStep('点击"保存并下单"按钮', async () => {
       await clickSaveButton(page);
     });
 

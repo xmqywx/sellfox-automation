@@ -46,3 +46,67 @@ export function openDb(path) {
   db.exec(SCHEMA);
   return db;
 }
+
+const COLS = [
+  'uuid','plan_type','year','make','model','body_type','colour','variant',
+  'doors','seats','odometer','transmission','engine','fuel_type',
+  'registration','vin','no_of_keys','seller_type','comment','damage',
+  'source_url','fetch_mode',
+];
+
+function findExisting(db, v) {
+  if (v.vin) {
+    const byVin = db.prepare('SELECT * FROM manheim WHERE vin = ?').get(v.vin);
+    if (byVin) return byVin;
+  }
+  if (v.registration) {
+    const byRego = db.prepare('SELECT * FROM manheim WHERE registration = ?').get(v.registration);
+    if (byRego) {
+      // both present but existing row's vin differs from incoming vin → conflict
+      if (v.vin && byRego.vin && byRego.vin !== v.vin) return null;
+      return byRego;
+    }
+  }
+  return null;
+}
+
+export function upsertVehicle(db, v) {
+  const existing = findExisting(db, v);
+
+  // 冲突检测：incoming 有 vin，且按 rego 找到一行但 vin 不同（existing 为 null 表示走新增）
+  if (v.vin && v.registration) {
+    const byRego = db.prepare('SELECT vin FROM manheim WHERE registration = ?').get(v.registration);
+    if (byRego && byRego.vin && byRego.vin !== v.vin) {
+      recordFailed(db, {
+        url: v.source_url, kind: 'field_conflict',
+        error: `rego ${v.registration} maps to vin ${byRego.vin} but incoming vin ${v.vin}`,
+        attempts: 0,
+      });
+    }
+  }
+
+  // 只取 COLS 中"已定义且非 null"的列构造参数对象。
+  // 关键：绑定的具名参数必须与 SQL 中出现的 @col 完全一致——
+  // better-sqlite3 对"多余/undefined 的具名参数"会抛 RangeError，
+  // 所以不能直接 .run(v)（v 上可能带未被 SQL 引用的键）。
+  const cols = COLS.filter((c) => v[c] !== undefined && v[c] !== null);
+  const params = {};
+  for (const c of cols) params[c] = v[c];
+
+  if (existing) {
+    const sets = cols.map((c) => `${c} = @${c}`).concat("last_seen = datetime('now')");
+    db.prepare(`UPDATE manheim SET ${sets.join(', ')} WHERE id = @id`)
+      .run({ ...params, id: existing.id });
+    return { id: existing.id, isNew: false };
+  }
+
+  const info = db.prepare(
+    `INSERT INTO manheim (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`
+  ).run(params);
+  return { id: Number(info.lastInsertRowid), isNew: true };
+}
+
+export function recordFailed(db, { url, kind, error, attempts }) {
+  db.prepare('INSERT INTO failed_requests (url, kind, error, attempts) VALUES (?,?,?,?)')
+    .run(url, kind, error, attempts ?? 0);
+}

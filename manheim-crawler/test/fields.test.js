@@ -13,6 +13,14 @@ describe('fields', () => {
     expect(v.vin).toBe('JT123');
   });
 
+  it('collapses internal whitespace/newlines in values', () => {
+    const v = {};
+    applyPair(v, 'Body Type', '4D \n   Hatch');
+    applyPair(v, 'Engine', '1.33\n   L');
+    expect(v.body_type).toBe('4D Hatch');
+    expect(v.engine).toBe('1.33 L');
+  });
+
   it('ignores unknown labels', () => {
     const v = {};
     applyPair(v, 'Totally Unknown', 'x');

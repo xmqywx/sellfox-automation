@@ -31,7 +31,8 @@ export async function run(cfg = config) {
         const { detailUrls, hasNext } = parseListing($, cfg.baseUrl);
         for (const url of detailUrls) enqueued.add(url);
         await addRequests(detailUrls.map((url) => ({ url, userData: { label: 'DETAIL' } })));
-        if (hasNext) {
+        // 仅当当前页确实产出了详情 URL 才翻页，防止最后一页仍渲染 a.next 导致页码无限攀升。
+        if (hasNext && detailUrls.length > 0) {
           const page = (request.userData.page || 1) + 1;
           await addRequests([{ url: buildListingUrl(cfg, page), userData: { label: 'LIST', page } }]);
         }
@@ -57,23 +58,27 @@ export async function run(cfg = config) {
     },
   }, new Configuration({ persistStorage: false }));
 
-  await crawler.addRequests([{ url: buildListingUrl(cfg, 1), userData: { label: 'LIST', page: 1 } }]);
-  await crawler.run();
-  await closeBrowser();
+  try {
+    await crawler.addRequests([{ url: buildListingUrl(cfg, 1), userData: { label: 'LIST', page: 1 } }]);
+    await crawler.run();
 
-  const report = reconcile([...enqueued], [...stored]);
-  console.log(`[reconcile] expected=${report.expected} stored=${report.stored} missing=${report.missing.length}`);
-  if (!report.ok) {
-    console.error('[reconcile] MISSING URLS:\n' + report.missing.join('\n'));
+    const report = reconcile([...enqueued], [...stored]);
+    console.log(`[reconcile] expected=${report.expected} stored=${report.stored} missing=${report.missing.length}`);
+    if (!report.ok) {
+      console.error('[reconcile] MISSING URLS:\n' + report.missing.join('\n'));
+    }
+
+    if (cfg.mysql.enabled) {
+      const { syncToMysql } = await import('../store/mysql-sync.js'); // lazy：默认关时不加载 mysql2
+      await syncToMysql(db, cfg);
+    }
+
+    return report;
+  } finally {
+    // 即使 crawler.run() 抛错也要关闭共享的 chromium 浏览器和 db，避免句柄泄漏。
+    await closeBrowser();
+    db.close();
   }
-
-  if (cfg.mysql.enabled) {
-    const { syncToMysql } = await import('../store/mysql-sync.js'); // lazy：默认关时不加载 mysql2
-    await syncToMysql(db, cfg);
-  }
-
-  db.close();
-  return report;
 }
 
 // 直接运行入口

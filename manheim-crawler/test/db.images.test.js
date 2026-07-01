@@ -24,6 +24,9 @@ describe('insertImages', () => {
     insertImages(db, id, 'uuid1', [{ url: 'http://a/1.jpg', s3_url: 's3://x/1.jpg' }]);
     const n = db.prepare('SELECT COUNT(*) n FROM manheim_image WHERE manheim_id=?').get(id).n;
     expect(n).toBe(1);
+    // ON CONFLICT ... COALESCE 应把原本为 null 的 s3_url 升级为新值。
+    const s3 = db.prepare('SELECT s3_url FROM manheim_image WHERE manheim_id=? AND url=?').get(id, 'http://a/1.jpg').s3_url;
+    expect(s3).toBe('s3://x/1.jpg');
     db.close();
   });
 });

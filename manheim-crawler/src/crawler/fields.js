@@ -22,5 +22,5 @@ export const FIELD_MAP = {
 export function applyPair(vehicle, label, value) {
   const key = String(label).replace(/:/g, '').trim();
   const col = FIELD_MAP[key];
-  if (col) vehicle[col] = String(value).trim();
+  if (col) vehicle[col] = String(value).replace(/\s+/g, ' ').trim();
 }

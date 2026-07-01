@@ -74,6 +74,7 @@ manheim-crawler/
   "dependencies": {
     "@aws-sdk/client-s3": "^3.658.0",
     "better-sqlite3": "^11.3.0",
+    "cheerio": "^1.0.0",
     "crawlee": "^3.11.5",
     "dotenv": "^16.4.5",
     "playwright": "^1.47.2"
@@ -503,19 +504,24 @@ export function upsertVehicle(db, v) {
     }
   }
 
+  // 只取 COLS 中"已定义且非 null"的列构造参数对象。
+  // 关键：绑定的具名参数必须与 SQL 中出现的 @col 完全一致——
+  // better-sqlite3 对"多余/undefined 的具名参数"会抛 RangeError，
+  // 所以不能直接 .run(v)（v 上可能带未被 SQL 引用的键）。
+  const cols = COLS.filter((c) => v[c] !== undefined && v[c] !== null);
+  const params = {};
+  for (const c of cols) params[c] = v[c];
+
   if (existing) {
-    const sets = COLS.filter((c) => v[c] !== undefined && v[c] !== null)
-      .map((c) => `${c} = @${c}`)
-      .concat("last_seen = datetime('now')");
+    const sets = cols.map((c) => `${c} = @${c}`).concat("last_seen = datetime('now')");
     db.prepare(`UPDATE manheim SET ${sets.join(', ')} WHERE id = @id`)
-      .run({ ...v, id: existing.id });
+      .run({ ...params, id: existing.id });
     return { id: existing.id, isNew: false };
   }
 
-  const insertCols = COLS.filter((c) => v[c] !== undefined);
   const info = db.prepare(
-    `INSERT INTO manheim (${insertCols.join(',')}) VALUES (${insertCols.map((c) => '@' + c).join(',')})`
-  ).run(v);
+    `INSERT INTO manheim (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`
+  ).run(params);
   return { id: Number(info.lastInsertRowid), isNew: true };
 }
 
@@ -663,8 +669,7 @@ node -e "import('cheerio').then(({ load }) => {
   console.log(Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,40));
 });"
 ```
-> 注：`cheerio` 随 crawlee 传递依赖已安装；若未装单独 `npm i cheerio`。
-Expected: 输出高频 class 列表，据此确定 `listItem` 与 `detailLink` 选择器，记入 `docs-recon.md`。
+Expected: 输出高频 class 列表，据此确定 `listItem` 与 `detailLink` 选择器，记入 `docs-recon.md`。（`cheerio` 已在 Task 1 显式声明为依赖。）
 
 - [ ] **Step 3: 抓一条详情页并判定"二次跳转"类型**
 
@@ -708,25 +713,58 @@ export const SELECTORS = {
     damageItem: '',      // 例：'.vehicle-damage .col-xs-6'
     dt: 'dt',
     dd: 'dd',
+    // presenceMarker：一段"真详情页已渲染"才会出现的子串（由 recon Step 3 从
+    // 直连成功的 detail.html 确认，例：'vehicle-details' 或某唯一容器 id）。
+    // 不得凭空猜——留空则 needsFallback 退化为"永远降级"，会拖慢但不漏。
+    presenceMarker: '',
   },
 };
 
-// 判定该详情 HTML 是否需要 Playwright 降级：解析不到关键块即为 true。
+// 判定该详情 HTML 是否需要 Playwright 降级：解析不到关键块或疑似跳转即为 true。
 export function needsFallback(html) {
   if (!html) return true;
-  // 无详情块 + 疑似跳转/空壳 → 降级
-  const hasDetails = SELECTORS.detail.detailsBlock && html.includes('vehicle-details');
+  const marker = SELECTORS.detail.presenceMarker;
+  // marker 未配置时保守降级（宁慢勿漏）；配置后按 recon 确认的子串判断
+  const hasDetails = marker ? html.includes(marker) : false;
   const looksRedirect = /<meta[^>]+http-equiv=["']?refresh/i.test(html)
     || /window\.location\s*=/.test(html);
   return !hasDetails || looksRedirect;
 }
 ```
 
-- [ ] **Step 5: 写 recon 记录 docs-recon.md**
+- [ ] **Step 5: 防猜值自检（硬 gate，未过不得进入解析任务）**
+
+对真实 fixture 逐一验证已填选择器命中数 > 0，且 `presenceMarker` 真实出现在直连成功的
+`detail.html` 里。任一为 0 / marker 找不到 = 选择器是猜的，**不算填完，回 Step 2/3 重定位**。
+
+Run:
+```bash
+cd manheim-crawler && node -e "
+import('cheerio').then(async ({ load }) => {
+  const fs = require('fs');
+  const { SELECTORS } = await import('./src/crawler/selectors.js');
+  const L = load(fs.readFileSync('test/fixtures/listing.html','utf8'));
+  const D = load(fs.readFileSync('test/fixtures/detail.html','utf8'));
+  const detailHtml = fs.readFileSync('test/fixtures/detail.html','utf8');
+  const checks = {
+    listItem: L(SELECTORS.listItem).length,
+    detailLink: L(SELECTORS.listItem).find(SELECTORS.detailLink).length,
+    detailsBlock: D(SELECTORS.detail.detailsBlock).length,
+    imageContainer: D(SELECTORS.detail.imageContainer).length,
+    markerPresent: SELECTORS.detail.presenceMarker && detailHtml.includes(SELECTORS.detail.presenceMarker),
+  };
+  console.log(checks);
+  const ok = checks.listItem>0 && checks.detailLink>0 && checks.detailsBlock>0 && checks.imageContainer>0 && checks.markerPresent;
+  if (!ok) { console.error('SELECTOR GATE FAILED — 选择器/marker 未从真实 HTML 坐实'); process.exit(1); }
+});"
+```
+Expected: 各项 > 0、`markerPresent: true`，进程退出码 0。
+
+- [ ] **Step 6: 写 recon 记录 docs-recon.md**
 
 内容必须包含：列表页 status、选定的各选择器及其依据、详情"二次跳转"实测结论（HTTP 302 还是 JS）、以及对 spec 中"Hutool 根因"的实证结论（坐实/修正）。
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add manheim-crawler/src/crawler/selectors.js manheim-crawler/test/fixtures/ manheim-crawler/docs-recon.md
@@ -857,7 +895,17 @@ describe('parseDetail', () => {
 });
 ```
 
-> 落地时：跑一次 recon fixture，把断言里的期望值改成该条真实车的实际 VIN/rego（避免"能过但没校验真值"）。
+- [ ] **Step 1b: 断言改真实值（防"能过但没校验真值"gate）**
+
+打开 `test/fixtures/detail.html`，读出该条真实车的实际 VIN 与 rego，把上面第一个测试的断言
+从"truthy 检查"改成**精确值断言**，例如：
+
+```js
+    expect(vehicle.vin).toBe('JT1234567890');       // ← 换成 detail.html 里的真实 VIN
+    expect(vehicle.make).toBe('Toyota');            // ← 至少再校验一个真实字段
+```
+
+未替换（仍是 `.toBeTruthy()`）即视为未完成本步。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -992,23 +1040,20 @@ function abs(baseUrl, href) {
 
 export function parseListing($, baseUrl) {
   const detailUrls = [];
-  const declaredKeys = [];
   $(SELECTORS.listItem).each((_, item) => {
     const href = $(item).find(SELECTORS.detailLink).first().attr('href');
     const url = abs(baseUrl, href);
     if (url) detailUrls.push(url);
-    if (SELECTORS.listDeclaredKey) {
-      const k = $(item).find(SELECTORS.listDeclaredKey).first().text().trim();
-      if (k) declaredKeys.push(k);
-    }
   });
 
   const hasNext = SELECTORS.pagination.nextLink
     ? $(SELECTORS.pagination.nextLink).length > 0
     : false;
 
-  return { detailUrls, declaredKeys, hasNext };
+  return { detailUrls, hasNext };
 }
+// 对账以详情 URL 集合为准：request.url 跨 302 保持不变，比列表页声明的 vin/rego 更稳。
+// selectors.listDeclaredKey 保留为预留字段，本期不用于对账。
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -1309,7 +1354,8 @@ import { needsFallback } from './selectors.js';
 import { fetchRenderedHtml, closeBrowser } from './fallback.js';
 import { uploadImages } from '../media/s3.js';
 import { reconcile } from '../reconcile.js';
-import { syncToMysql } from '../store/mysql-sync.js';
+// 注意：mysql-sync 用 lazy import（见文末），避免核心抓取强依赖 mysql2，
+// 也修掉"main.js 在 Task 14 之前就 import 不存在模块"的顺序问题。
 
 export async function run(cfg = config) {
   const db = openDb(cfg.dbPath);
@@ -1373,7 +1419,10 @@ export async function run(cfg = config) {
     console.error('[reconcile] MISSING URLS:\n' + report.missing.join('\n'));
   }
 
-  if (cfg.mysql.enabled) await syncToMysql(db, cfg);
+  if (cfg.mysql.enabled) {
+    const { syncToMysql } = await import('../store/mysql-sync.js'); // lazy：默认关时不加载 mysql2
+    await syncToMysql(db, cfg);
+  }
 
   db.close();
   return report;
@@ -1515,6 +1564,9 @@ Expected: 结束打印 `[reconcile] ... missing=N`。
 通过 = **missing=0**（spec 10 节量化标准：新库 VIN/URL 集合 ⊇ 列表声明集合）。
 - 若 `missing>0`：查 `last-run.log` 里列出的 URL 与 `failed_requests` 表，逐条定位（跳转未识别 / 降级失败 / 选择器漏），修复后回归。
 - 用 SQL 抽查若干条：`sqlite3 data/manheim.sqlite "SELECT vin,registration,make,model,fetch_mode FROM manheim LIMIT 20"`，确认字段真实非空、`fetch_mode` 分布合理。
+- **可校验门槛（字段真实非空）**：跑
+  `sqlite3 data/manheim.sqlite "SELECT COUNT(*) total, SUM(vin IS NOT NULL OR registration IS NOT NULL) has_key, SUM(make IS NOT NULL) has_make FROM manheim"`，
+  要求 `has_key = total`（每条都有 vin 或 rego，否则不该入库）且 `has_make/total ≥ 0.9`（make 非空率≥90%，低于则说明详情块选择器有漏，回 Task 8）。
 
 - [ ] **Step 3: 与旧结果对比（若能拿到旧库/旧抓取结果）**
 

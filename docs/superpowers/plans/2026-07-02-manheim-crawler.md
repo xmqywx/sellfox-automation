@@ -4,9 +4,9 @@
 
 **Goal:** 用 Node.js + Crawlee 重写 Manheim NZ 车源爬虫，根治"二次跳转导致的随机漏车"，把数据落 SQLite 并对账不漏，图片上传 S3，预留 MySQL 写回。
 
-**Architecture:** `CheerioCrawler` 走快路径抓静态 HTML，关键字段缺失或检测到跳转时对单条无缝降级到 Playwright；数据经 vin/rego 去重后 upsert 进 SQLite；抓完做"列表声明 vs 入库"对账，漏车可见可报警。各模块单一职责、可独立测试。
+**Architecture:** `BasicCrawler`（Crawlee 队列/重试/并发）+ 自建 fetch 层：**curl 快路径 → Playwright 兜底**（原 `CheerioCrawler`/gotScraping 实测被 403 指纹拦截，见 spec recon 更正）；抓到的 HTML 用 cheerio 解析，数据经 vin/rego 去重后 upsert 进 SQLite；抓完做"列表声明 vs 入库"对账，漏车可见可报警。各模块单一职责、可独立测试。
 
-**Tech Stack:** Node.js 22 (ESM) · Crawlee 3 (`CheerioCrawler` + got-scraping) · Playwright (chromium) · better-sqlite3 · @aws-sdk/client-s3 · dotenv · vitest（测试）
+**Tech Stack:** Node.js 22 (ESM) · Crawlee 3 (`BasicCrawler`) · curl（系统二进制，快路径抓取）· Playwright (chromium，兜底) · cheerio（解析）· better-sqlite3 · @aws-sdk/client-s3 · dotenv · vitest（测试）
 
 **Spec:** `docs/superpowers/specs/2026-07-02-manheim-crawler-rewrite-design.md`
 
@@ -1334,64 +1334,187 @@ git commit -m "feat(crawler): 对账(列表声明 vs 入库)"
 
 ---
 
+### Task 12b: fetch 层 fetcher.js（curl 快路径 + Playwright 兜底）
+
+> 由 recon 实证新增：gotScraping 被网站 403 指纹拦截，curl 与真浏览器放行。此模块把
+> "抓 HTML"从被封的 gotScraping 解耦出来。`fetchHtml` 支持依赖注入以便纯 mock 测降级逻辑。
+
+**Files:**
+- Create: `manheim-crawler/src/crawler/fetcher.js`
+- Test: `manheim-crawler/test/fetcher.test.js`
+
+- [ ] **Step 1: 写失败测试（降级逻辑用 DI 全 mock；curl 快路径一条网络冒烟）**
+
+```js
+// test/fetcher.test.js
+import { describe, it, expect, vi } from 'vitest';
+import { fetchHtml, curlFetch } from '../src/crawler/fetcher.js';
+
+describe('fetchHtml (降级逻辑, 注入 deps)', () => {
+  it('uses curl result when status 200 and content ok', async () => {
+    const deps = {
+      curlFetch: vi.fn().mockResolvedValue({ html: '<html>vehicle-details ok</html>', status: 200 }),
+      fetchRenderedHtml: vi.fn(),
+    };
+    const r = await fetchHtml('http://x/detail', { isDetail: true, deps });
+    expect(r.mode).toBe('curl');
+    expect(deps.fetchRenderedHtml).not.toHaveBeenCalled();
+  });
+
+  it('falls back to playwright when curl returns non-200', async () => {
+    const deps = {
+      curlFetch: vi.fn().mockResolvedValue({ html: '', status: 403 }),
+      fetchRenderedHtml: vi.fn().mockResolvedValue('<html>rendered vehicle-details</html>'),
+    };
+    const r = await fetchHtml('http://x/detail', { isDetail: true, deps });
+    expect(r.mode).toBe('playwright');
+    expect(deps.fetchRenderedHtml).toHaveBeenCalledOnce();
+  });
+
+  it('falls back when detail content lacks presence marker', async () => {
+    const deps = {
+      curlFetch: vi.fn().mockResolvedValue({ html: '<html>empty shell</html>', status: 200 }),
+      fetchRenderedHtml: vi.fn().mockResolvedValue('<html>rendered vehicle-details</html>'),
+    };
+    const r = await fetchHtml('http://x/detail', { isDetail: true, deps });
+    expect(r.mode).toBe('playwright');
+  });
+});
+
+describe('curlFetch (网络冒烟)', () => {
+  it('fetches the real listing page (200 + vehicle-item)', async () => {
+    const { html, status } = await curlFetch(
+      'https://www.manheim.co.nz/damaged-vehicles/auctions/ND060726/page1?franchiseID=SALVAGENZ'
+    );
+    expect(status).toBe(200);
+    expect(html).toContain('vehicle-item');
+  });
+});
+```
+
+> 注：`needsFallback`（selectors.js）用 `presenceMarker`（recon 定为 `vehicle-details`）判定详情页内容是否完整；上面第 1/3 条测试据此走不同分支。若该网络冒烟因离线失败，可临时 `it.skip`，但端到端(Task 15)必须真实跑通。
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cd manheim-crawler && npx vitest run test/fetcher.test.js`
+Expected: FAIL（模块未定义）。
+
+- [ ] **Step 3: 实现 fetcher.js**
+
+```js
+// src/crawler/fetcher.js
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { readFile, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { fetchRenderedHtml as defaultRender } from './fallback.js';
+import { needsFallback } from './selectors.js';
+
+const execFileAsync = promisify(execFile);
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// 用系统 curl 抓取（当前放行网站的指纹拦截；-L 跟随重定向）。返回 { html, status }。
+export async function curlFetch(url, { timeoutMs = 20000 } = {}) {
+  const tmp = join(tmpdir(), `mh-${randomBytes(8).toString('hex')}.html`);
+  try {
+    const { stdout } = await execFileAsync('curl', [
+      '-sL', '-A', UA, '--compressed',
+      '--max-time', String(Math.ceil(timeoutMs / 1000)),
+      '-o', tmp, '-w', '%{http_code}', url,
+    ], { maxBuffer: 32 * 1024 * 1024 });
+    const status = parseInt(String(stdout).trim(), 10) || 0;
+    const html = await readFile(tmp, 'utf8').catch(() => '');
+    return { html, status };
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}
+
+// 统一 fetch：curl 快路径；非 200 或（详情页）内容不完整 → Playwright 兜底。
+// deps 可注入 curlFetch / fetchRenderedHtml（测试用）。
+export async function fetchHtml(url, { isDetail = false, deps = {} } = {}) {
+  const _curl = deps.curlFetch || curlFetch;
+  const _render = deps.fetchRenderedHtml || defaultRender;
+  try {
+    const { html, status } = await _curl(url);
+    if (status === 200 && !(isDetail && needsFallback(html))) {
+      return { html, status, mode: 'curl' };
+    }
+  } catch {
+    // 落到 Playwright
+  }
+  const html = await _render(url, { waitSelector: 'body' });
+  return { html, status: 200, mode: 'playwright' };
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `cd manheim-crawler && npx vitest run test/fetcher.test.js`
+Expected: PASS（4 tests；如离线则 3 passed + 1 skipped）。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add manheim-crawler/src/crawler/fetcher.js manheim-crawler/test/fetcher.test.js
+git commit -m "feat(crawler): fetch 层(curl 快路径+Playwright 兜底, 绕过 403 指纹拦截)"
+```
+
+---
+
 ### Task 13: 编排 main.js
 
 **Files:**
 - Create: `manheim-crawler/src/crawler/main.js`
 - Test: 无独立单测（编排层）；靠 Task 15 端到端验证。人工冒烟即可。
 
-- [ ] **Step 1: 实现 main.js（Crawlee CheerioCrawler + 路由 + 降级 + 入库 + 对账）**
+- [ ] **Step 1: 实现 main.js（BasicCrawler + fetch 层 + 路由 + 入库 + 对账）**
 
 ```js
 // src/crawler/main.js
-import { CheerioCrawler, Configuration } from 'crawlee';
+import { BasicCrawler, Configuration } from 'crawlee';
 import { load } from 'cheerio';
 import { config } from '../config.js';
 import { openDb, upsertVehicle, insertImages, recordFailed } from '../store/db.js';
 import { buildListingUrl, parseListing } from './listing.js';
 import { parseDetail } from './detail.js';
-import { needsFallback } from './selectors.js';
-import { fetchRenderedHtml, closeBrowser } from './fallback.js';
+import { fetchHtml } from './fetcher.js';
+import { closeBrowser } from './fallback.js';
 import { uploadImages } from '../media/s3.js';
 import { reconcile } from '../reconcile.js';
-// 注意：mysql-sync 用 lazy import（见文末），避免核心抓取强依赖 mysql2，
-// 也修掉"main.js 在 Task 14 之前就 import 不存在模块"的顺序问题。
+// mysql-sync 用 lazy import（默认关时不加载 mysql2）。
 
 export async function run(cfg = config) {
   const db = openDb(cfg.dbPath);
   const enqueued = new Set();
   const stored = new Set();
 
-  const crawler = new CheerioCrawler({
+  const crawler = new BasicCrawler({
     maxConcurrency: cfg.maxConcurrency,
     maxRequestRetries: cfg.maxRequestRetries,
-    // Crawlee/got-scraping 默认跟随 302 —— 根因修复点
-    proxyConfiguration: cfg.proxyUrl
-      ? new (await import('crawlee')).ProxyConfiguration({ proxyUrls: [cfg.proxyUrl] })
-      : undefined,
-    async requestHandler({ request, $, body, enqueueLinks, addRequests }) {
+    // BasicCrawler 由我们在 handler 内自行 fetch（curl 快路径 / Playwright 兜底），
+    // 绕过 gotScraping 的 403 指纹拦截；队列/重试/并发仍由 Crawlee 提供。
+    async requestHandler({ request, addRequests }) {
       const label = request.userData.label;
+      const isDetail = label === 'DETAIL';
+      const { html, mode } = await fetchHtml(request.url, { isDetail });
+      const $ = load(html);
 
       if (label === 'LIST') {
         const { detailUrls, hasNext } = parseListing($, cfg.baseUrl);
         for (const url of detailUrls) enqueued.add(url);
         await addRequests(detailUrls.map((url) => ({ url, userData: { label: 'DETAIL' } })));
         if (hasNext) {
-          const next = buildListingUrl(cfg, (request.userData.page || 1) + 1);
-          await addRequests([{ url: next, userData: { label: 'LIST', page: (request.userData.page || 1) + 1 } }]);
+          const page = (request.userData.page || 1) + 1;
+          await addRequests([{ url: buildListingUrl(cfg, page), userData: { label: 'LIST', page } }]);
         }
         return;
       }
 
       // DETAIL
-      let $doc = $;
-      let mode = 'cheerio';
-      if (needsFallback(String(body))) {
-        const html = await fetchRenderedHtml(request.url, { waitSelector: 'body' });
-        $doc = load(html);
-        mode = 'playwright';
-      }
-      const { vehicle, images } = parseDetail($doc, request.url);
+      const { vehicle, images } = parseDetail($, request.url);
       vehicle.fetch_mode = mode;
 
       if (!vehicle.vin && !vehicle.registration) {
@@ -1436,8 +1559,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 
 - [ ] **Step 2: 人工冒烟（小并发跑通，不求抓全，只验证不崩）**
 
-Run: `cd manheim-crawler && MAX_CONCURRENCY=2 npm run crawl`
-Expected: 打印 `[reconcile] expected=... stored=... missing=...`，`data/manheim.sqlite` 生成且有行。若崩，按报错定位（多半是 selectors 未从 recon 填全 → 回 Task 6）。
+先确保 Playwright 浏览器已就绪（兜底用）：`PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install chromium`。
+
+Run: `cd manheim-crawler && PLAYWRIGHT_BROWSERS_PATH=0 MAX_CONCURRENCY=2 npm run crawl`
+Expected: 打印 `[reconcile] expected=... stored=... missing=...`，`data/manheim.sqlite` 生成且有行，且大部分详情 `fetch_mode='curl'`。若崩，按报错定位（多半是 selectors 未从 recon 填全 → 回 Task 6，或 curl 不可用 → 检查系统 curl）。
 
 - [ ] **Step 3: Commit**
 
@@ -1556,8 +1681,8 @@ git commit -m "feat(crawler): MySQL 写回(预留/可开关/幂等)"
 
 - [ ] **Step 1: 全量跑一次真实抓取**
 
-Run: `cd manheim-crawler && npm run crawl 2>&1 | tee scripts/last-run.log`
-Expected: 结束打印 `[reconcile] ... missing=N`。
+Run: `cd manheim-crawler && PLAYWRIGHT_BROWSERS_PATH=0 npm run crawl 2>&1 | tee scripts/last-run.log`
+Expected: 结束打印 `[reconcile] ... missing=N`。抓取应主要走 curl 快路径（`fetch_mode='curl'`），仅被拦/内容不全的条目走 Playwright。
 
 - [ ] **Step 2: 判定通过标准**
 

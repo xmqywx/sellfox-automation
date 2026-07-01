@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS manheim_image (
   s3_url TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_image_manheim ON manheim_image(manheim_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_image ON manheim_image(manheim_id, url);
 
 CREATE TABLE IF NOT EXISTS failed_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,4 +110,16 @@ export function upsertVehicle(db, v) {
 export function recordFailed(db, { url, kind, error, attempts }) {
   db.prepare('INSERT INTO failed_requests (url, kind, error, attempts) VALUES (?,?,?,?)')
     .run(url, kind, error, attempts ?? 0);
+}
+
+export function insertImages(db, manheimId, uuid, images) {
+  const stmt = db.prepare(
+    `INSERT INTO manheim_image (manheim_id, uuid, url, s3_url)
+     VALUES (?,?,?,?)
+     ON CONFLICT(manheim_id, url) DO UPDATE SET s3_url = COALESCE(excluded.s3_url, s3_url)`
+  );
+  const tx = db.transaction((rows) => {
+    for (const img of rows) stmt.run(manheimId, uuid, img.url, img.s3_url ?? null);
+  });
+  tx(images);
 }

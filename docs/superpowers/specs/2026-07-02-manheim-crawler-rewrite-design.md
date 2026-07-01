@@ -12,7 +12,19 @@
 
 线上表现：每次抓取都会**随机漏车**（有的车抓到、有的没抓到，时好时坏）。
 
-### 根因（已定位，高置信度，静态分析）
+### ⚠️ 2026-07-02 Recon 更正（实测推翻原假设）
+
+下面"Hutool 302"是**静态分析时的假设，已被实测推翻**，保留作记录：
+- 详情页 URL **直接返回 HTTP 200、零重定向**，原始 HTML 即含 `vehicle-details`——**不存在二次跳转**。
+- 真正复现的是 **TLS/HTTP 指纹级 403 拦截**：`gotScraping`（Crawlee 默认引擎，got/undici 栈）
+  被网站 403；而 `curl`（任意 UA）与真 Playwright/Chromium 均 200。
+- **更合理的漏车解释**：基于指纹/频率的 403 在高并发下部分请求被拦、部分放行，
+  叠加旧 Java 版 Hutool 的"吞异常 + 不重试"，被拦的车静默漏掉——吻合"时好时坏、间歇漏车"，
+  而单纯 302 解释不了间歇性。
+- **对实现的影响**：抓取传输层不能用 gotScraping（会全量 403）。改为
+  **BasicCrawler + curl 快路径 → Playwright 兜底**（见第 3 节更新）。详见 `manheim-crawler/docs-recon.md`。
+
+### 根因（原假设，已被上方 recon 更正推翻——保留记录）
 
 主因在详情页请求：
 
@@ -59,10 +71,12 @@ Hutool 拿到的是跳转壳页，解析不出 `vehicle-details` → VIN/车牌�
     内置 SessionPool 轮换、可插代理、429/403 自动退避。
   - 速度：静态页用 `CheerioCrawler` 纯 HTTP + 自动伸缩并发。
   - 长期可用：疑难条无缝降级 Playwright，扛住网站偶尔上 JS 反爬。
-- **抓取引擎（方案 B：Cheerio + Playwright 降级）**：
-  默认 `CheerioCrawler` 抓 HTML；当某条详情页关键字段(VIN/rego)解析不到、
-  或检测到 meta-refresh / JS 跳转时，**只对该条**降级到 Playwright 真浏览器补抓。
-  99% 走快路径，疑难条走稳路径。
+- **抓取引擎（方案 B 更新版：BasicCrawler + curl 快路径 + Playwright 降级）**：
+  ⚠️ 原计划的 `CheerioCrawler` 走 `gotScraping`，实测被网站 **403 指纹拦截**（见上方 recon 更正），
+  故改用 **`BasicCrawler`**（保留 Crawlee 的 RequestQueue / 重试退避 / 并发 / failedRequestHandler），
+  由我们自建 fetch 层：**curl 快路径**（当前放行、快）→ 非 200 或关键字段缺失时**降级 Playwright 真浏览器**。
+  99% 走 curl 快路径，疑难/被拦条走浏览器稳路径。curl 依赖系统二进制（macOS/Linux 自带）；
+  长期若 curl 指纹也被拦，可换 curl-impersonate 或全量 Playwright（fetch 层已解耦，替换成本低）。
 - **存储**：SQLite（`better-sqlite3`）作为主存储与对账真相源；
   MySQL 写回为可开关的预留步骤。
 - **图片**：下载后上传 S3（`@aws-sdk/client-s3`），存最终 S3 URL。

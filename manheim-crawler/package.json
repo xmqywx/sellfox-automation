@@ -1,0 +1,23 @@
+{
+  "name": "manheim-crawler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "crawl": "node src/crawler/main.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.658.0",
+    "better-sqlite3": "^11.3.0",
+    "cheerio": "^1.0.0",
+    "crawlee": "^3.11.5",
+    "dotenv": "^16.4.5",
+    "mysql2": "^3.11.0",
+    "playwright": "^1.47.2"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.2"
+  }
+}

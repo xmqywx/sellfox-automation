@@ -32,7 +32,7 @@ Hutool 拿到的是跳转壳页，解析不出 `vehicle-details` → VIN/车牌�
    会中断整条 for 循环 → 该拍卖计划后续所有车全丢，且无日志。
 2. **无图不入库**（`if(CollUtil.isNotEmpty(manheimImages))` 才 insert）：
    没图的车即使 VIN/车牌齐全也永不保存。
-3. `getElementsByAttributeValueContaining("WT.z_aucid").get(0)`：页面结构变动取不到即
+3. `getElementsByAttributeValueContaining("name", "WT.z_aucid").get(0)`：页面结构变动取不到即
    `IndexOutOfBounds`，整条计划线程直接挂掉。
 4. 详情请求无重试、无 User-Agent，易被限流。
 
@@ -132,6 +132,9 @@ comment, damage` + 新增运维字段
 - **去重键**：vin 或 registration。
 - **策略改动**：原版命中即 `skip`（存在即丢弃，埋掉更新）；本设计改为 **upsert**，
   更新 `last_seen` 与可能变化的字段，避免丢失数据更新。
+- **去重冲突边界（planner 需处理）**：优先按 vin 匹配（vin 非空时以 vin 为准），
+  vin 为空再退回 registration；两者都在但跨次抓取不一致时，以 vin 命中的既有行为准更新，
+  并记录一条 `field_conflict` 告警，避免误合并两辆不同的车。
 
 ## 7. 关键改进（对应第 1 节 4 个隐患）
 
@@ -162,6 +165,9 @@ comment, damage` + 新增运维字段
 - **对账单测**：构造"列表 N 辆、入库 M 辆"场景，验证漏车 URL 正确列出。
 - **去重/upsert 单测**：同 vin/rego 二次抓取应更新而非重复插入。
 - **端到端验证**：对 `ND060726` / `SALVAGENZ` 小样真实跑通，人工核对不漏。
+- **量化通过标准（pass/fail bar）**：以列表页声明的 VIN/rego 集合为基准，
+  `新库 VIN 集合 ⊇ 列表声明集合`，即 **ND060726 上 missing 数 = 0** 才算通过；
+  若有 missing，对账报告须逐条列出漏掉的详情 URL。
 
 ## 11. 实现顺序（含必做的 recon）
 

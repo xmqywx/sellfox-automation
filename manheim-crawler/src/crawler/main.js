@@ -43,8 +43,11 @@ export async function run(cfg = config) {
       const { vehicle, images } = parseDetail($, request.url);
       vehicle.fetch_mode = mode;
 
-      if (!vehicle.vin && !vehicle.registration) {
-        recordFailed(db, { url: request.url, kind: 'empty', error: 'no vin/rego after fetch', attempts: request.retryCount });
+      // 只在"连车辆基本信息都解析不到"时才判为空跳过（说明抓取/解析失败）。
+      // 摩托/ATV 等无 vin/rego 但有 make + item_id 的车照常入库（用 item_id 兜底去重），不再漏。
+      const hasIdentifier = vehicle.vin || vehicle.registration || vehicle.item_id;
+      if (!hasIdentifier || (!vehicle.vin && !vehicle.registration && !vehicle.make)) {
+        recordFailed(db, { url: request.url, kind: 'empty', error: 'no identifier/make after fetch', attempts: request.retryCount });
         return; // 对账会把它算作 missing → 可见
       }
 

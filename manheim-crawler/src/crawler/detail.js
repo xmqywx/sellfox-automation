@@ -20,6 +20,11 @@ function applyBlock($, blockSel, vehicle) {
 export function parseDetail($, sourceUrl) {
   const vehicle = { source_url: sourceUrl, fetch_mode: 'cheerio' };
 
+  // Manheim 详情 URL 的第一段是稳定的 item id：/damaged-vehicles/<item_id>/<slug>
+  // 摩托/ATV 等无 vin/rego 的车用它做兜底唯一键，避免被跳过漏车。
+  const m = String(sourceUrl).match(/\/damaged-vehicles\/([^/?#]+)/);
+  if (m) vehicle.item_id = m[1];
+
   applyBlock($, S.detailsBlock, vehicle);
   applyBlock($, S.infoBlock, vehicle);
 

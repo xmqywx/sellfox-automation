@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS manheim (
   doors TEXT, seats TEXT, odometer TEXT, transmission TEXT, engine TEXT,
   fuel_type TEXT, registration TEXT, vin TEXT, no_of_keys TEXT, seller_type TEXT,
   comment TEXT, damage TEXT,
+  item_id TEXT,
   source_url TEXT,
   fetch_mode TEXT,
   first_seen TEXT DEFAULT (datetime('now')),
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS manheim (
 );
 CREATE INDEX IF NOT EXISTS idx_manheim_vin ON manheim(vin);
 CREATE INDEX IF NOT EXISTS idx_manheim_rego ON manheim(registration);
+CREATE INDEX IF NOT EXISTS idx_manheim_item ON manheim(item_id);
 
 CREATE TABLE IF NOT EXISTS manheim_image (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +54,7 @@ const COLS = [
   'uuid','plan_type','year','make','model','body_type','colour','variant',
   'doors','seats','odometer','transmission','engine','fuel_type',
   'registration','vin','no_of_keys','seller_type','comment','damage',
-  'source_url','fetch_mode',
+  'item_id','source_url','fetch_mode',
 ];
 
 function findExisting(db, v) {
@@ -67,6 +69,11 @@ function findExisting(db, v) {
       if (v.vin && byRego.vin && byRego.vin !== v.vin) return null;
       return byRego;
     }
+  }
+  // 兜底：无 vin/rego 命中时按 item_id 去重（摩托/ATV 等无 vin/rego 的车）
+  if (v.item_id) {
+    const byItem = db.prepare('SELECT * FROM manheim WHERE item_id = ?').get(v.item_id);
+    if (byItem) return byItem;
   }
   return null;
 }

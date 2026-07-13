@@ -50,8 +50,9 @@ manheim-crawler/src/
     main.js          # 【改】parseDetail 后补 uuid=cfg.auctionId, plan_type
     fields/detail    # uuid/plan_type 不来自 DOM，由编排注入（见下）
   store/
-    db.js            # 【改】manheim 表加 uuid/plan_type 已有列(已存在) → 确认写入
-    mysql-sync.js    # 【改】生产可用：全字段映射 + vin/rego/item_id 去重 + 图片
+    db.js            # 【不改】manheim 表已有 uuid/plan_type/item_id 列；只需确认 main.js 注入后写入
+    mysql-sync.js    # 【重写】现为 ON DUPLICATE KEY UPDATE（生产无唯一键→会重复插入），
+                     #   必须改写为 SELECT-先查-不存在才插 + 全字段 + item_id + 图片
     mysql-migrate.js # 【新】幂等加 item_id 列 + 索引（生产 schema 迁移）
   sync-all.js        # 【新】编排：discover → 逐场 crawl → mysql-sync → 汇总
 scripts/
@@ -90,15 +91,29 @@ CREATE INDEX idx_manheim_item ON car_crawler_manheim (item_id);
   `ADD COLUMN IF NOT EXISTS`，用信息模式判断）。
 - 回滚：`ALTER TABLE car_crawler_manheim DROP COLUMN item_id;`（列可空，删除安全）。
 - 执行前**干跑打印 SQL + 用户确认**再执行。
+- **权限已实测（2026-07-14）**：`admin` 账号具备 `ALTER`/`INDEX`/`rds_superuser_role`，
+  可执行加列。
 
 ## 7. mysql-sync 去重与共存
 
-- 去重（存在即跳过，不 UPDATE，避免覆盖 Java 写的行）：
-  `SELECT id WHERE vin=? OR registration=? OR (item_id IS NOT NULL AND item_id=?)`。
-- Java 也按 vin/rego 去重插入 → 两者对同一车都不会重复插。
-- 无 vin/rego 车：Java 会跳过（旧 bug），新爬虫按 item_id 插入 → 只有新爬虫会写它们，
-  不冲突。
+> ⚠️ **必须重写，不是扩展**：现有 `mysql-sync.js` 的 `syncRows` 用
+> `INSERT ... ON DUPLICATE KEY UPDATE`。但**已实测（2026-07-14）生产表
+> `car_crawler_manheim` 只有 PRIMARY(id)，vin/registration 上无任何唯一键**，
+> 所以 ON DUPLICATE 永不触发 → 每次运行会把全部车重复插入。因此本设计要求
+> **删除 upsert 语义、改为 SELECT-先查-不存在才插**。同时现有代码只映射 20 列、
+> 无 item_id、无图片、无 create_by/time —— 一并在重写中补齐。
+
+- **去重是应用层（SELECT-先查），不是 DB 约束**（生产无唯一键；且库中已存在重复 vin，
+  如 `7AT0DH12X22103114` x2，系 Java 历史遗留）。查存在：
+  `SELECT id WHERE vin=? OR registration=? OR (item_id IS NOT NULL AND item_id=?)`，
+  命中即跳过、不 INSERT、不 UPDATE。
+- **权衡（需明确接受）**：跳过即"存在的车所有字段冻结在首次入库值"——后续里程/损伤/备注
+  修正不会更新。本设计接受此权衡（与 Java 现状一致：Java 也是命中即 skip）。
+- Java 也按 vin/rego 跳过插入 → 两者对同一车都不重复插。
+- 无 vin/rego 车：Java 跳过（旧 bug），新爬虫按 item_id 插入 → 只有新爬虫写它们，不冲突。
 - `create_by/update_by='System'`，`create_time/update_time=NOW()`，与 Java 一致。
+- **图片跨库 id 映射（易错点）**：先 INSERT 车、取 MySQL 返回的 `insertId` 作为
+  `car_crawler_manheim_image.manheim_id`——**不是 SQLite 的 id**。图片 uuid 用该车的拍卖代码。
 
 ## 8. 错误处理
 
@@ -109,7 +124,8 @@ CREATE INDEX idx_manheim_item ON car_crawler_manheim (item_id);
 
 ## 9. 测试
 
-- `discover.js`：用真实首页渲染快照 fixture，断言能抽出 SALVAGENZ 代码、过滤掉其他 franchise。
+- `discover.js`：用真实首页渲染快照 fixture，断言能抽出 SALVAGENZ 代码、过滤掉其他 franchise；
+  另加一条"结构损坏/0 解析"的 fixture，断言 **抛错而非返回 `[]`**（避免把"页面变了"当"今天没拍卖"）。
 - `mysql-migrate.js`：注入假 conn，断言"列不存在→执行 ADD；已存在→跳过"。
 - `mysql-sync.js`：注入假 conn，覆盖三分支去重（vin 命中/rego 命中/item_id 命中→跳过；
   全不命中→插入），断言 SQL 含 item_id 与全字段；图片写入。
@@ -128,7 +144,9 @@ CREATE INDEX idx_manheim_item ON car_crawler_manheim (item_id);
 
 ## 11. 待确认 / 风险
 
-- 生产库写权限：`admin` 账号可 ALTER/INSERT（已用 INSERT 回填过，ALTER 需确认权限）。
+- ~~生产库写权限~~ **已实测**：`admin` 具备 INSERT/ALTER/INDEX/rds_superuser，权限充足。
+- ~~vin/rego 唯一键~~ **已实测**：生产表仅 PRIMARY(id)，无唯一键 → 去重只能靠应用层
+  SELECT-先查（见 §7）；库中已有重复 vin 属历史遗留，本设计不清理旧重复、只保证不新增。
 - 首页渲染依赖 Playwright（本地已 `PLAYWRIGHT_BROWSERS_PATH=0` 安装 chromium）。
 - 本地机器需常开才能定时跑（本轮接受；服务器化以后再说）。
 - 共存期 uuid 语义：同一车跨多场时 MySQL 可能已有旧 uuid 行 → 按 vin/rego 命中即跳过，

@@ -121,9 +121,9 @@ git commit -m "feat(crawler): 幂等迁移脚本 给生产表加 item_id 列"
 
 - [ ] **Step 1: 干跑（只查，不改）**
 
-Run（在 `manheim-crawler/`，用 `.env` 或环境变量提供 DB_HOST/DB_USER/DB_PWD/DB_NAME）：
+Run（在 `manheim-crawler/`，用 `.env` 或环境变量提供 MYSQL_HOST/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DATABASE，与 config.js 一致）：
 ```bash
-node -e "import('mysql2/promise').then(async m=>{const c=await m.default.createConnection({host:process.env.DB_HOST,port:3306,user:process.env.DB_USER,password:process.env.DB_PWD,database:process.env.DB_NAME});const [x]=await c.query(\"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME='car_crawler_manheim' AND COLUMN_NAME='item_id'\",[process.env.DB_NAME]);console.log('item_id exists:',x.length>0);await c.end();})"
+node -e "import('mysql2/promise').then(async m=>{const c=await m.default.createConnection({host:process.env.MYSQL_HOST,port:Number(process.env.MYSQL_PORT||3306),user:process.env.MYSQL_USER,password:process.env.MYSQL_PASSWORD,database:process.env.MYSQL_DATABASE});const [x]=await c.query(\"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME='car_crawler_manheim' AND COLUMN_NAME='item_id'\",[process.env.MYSQL_DATABASE]);console.log('item_id exists:',x.length>0);await c.end();})"
 ```
 Expected: `item_id exists: false`（首次）。
 
@@ -131,13 +131,14 @@ Expected: `item_id exists: false`（首次）。
 
 Run:
 ```bash
-node -e "import('./src/store/mysql-migrate.js').then(async M=>{const m=await import('mysql2/promise');const c=await m.default.createConnection({host:process.env.DB_HOST,port:3306,user:process.env.DB_USER,password:process.env.DB_PWD,database:process.env.DB_NAME});const r=await M.ensureItemIdColumn(c,{dbName:process.env.DB_NAME});console.log(r);await c.end();})"
+node -e "import('./src/store/mysql-migrate.js').then(async M=>{const m=await import('mysql2/promise');const c=await m.default.createConnection({host:process.env.MYSQL_HOST,port:Number(process.env.MYSQL_PORT||3306),user:process.env.MYSQL_USER,password:process.env.MYSQL_PASSWORD,database:process.env.MYSQL_DATABASE});const r=await M.ensureItemIdColumn(c,{dbName:process.env.MYSQL_DATABASE});console.log(r);await c.end();})"
 ```
 Expected: `{ added: true }`（首次）；重跑应 `{ added: false }`（幂等）。
 
 - [ ] **Step 3: 记录到 scripts/run-migration.md**
 
 写明执行时间、before/after（`SHOW COLUMNS FROM car_crawler_manheim LIKE 'item_id'`）、回滚命令 `ALTER TABLE car_crawler_manheim DROP COLUMN item_id;`。
+另核查索引已建：`SHOW INDEX FROM car_crawler_manheim WHERE Key_name='idx_manheim_item'`；若上次半途加了列但索引没建成（迁移脚本会因列已存在而跳过建索引），手动补 `CREATE INDEX idx_manheim_item ON car_crawler_manheim (item_id);`。
 
 - [ ] **Step 4: Commit**
 
@@ -261,10 +262,13 @@ const broken = readFileSync(new URL('./fixtures/homepage-broken.html', import.me
 describe('parseAuctionsFromHtml', () => {
   it('extracts SALVAGENZ auction codes only', () => {
     const list = parseAuctionsFromHtml(rendered);
+    const codes = list.map(a => a.code);
     expect(list.length).toBeGreaterThan(0);
     for (const a of list) expect(a.code).toMatch(/^[A-Z]{2}[0-9]{6}$/);
-    // 不应包含非 SALVAGENZ franchise 的代码（如 passenger PP/PS, trucks）
-    expect(list.every(a => a.franchise === 'SALVAGENZ')).toBe(true);
+    // 硬校验真值：fixture 里真实存在的某个 SALVAGENZ 代码必须被抽到
+    expect(codes).toContain('__FILL_REAL_SALVAGE_CODE__');
+    // 过滤生效：fixture 里存在的某个非 SALVAGENZ 代码（passenger PP/PS 或 trucks）必须不在列表
+    expect(codes).not.toContain('__FILL_REAL_NON_SALVAGE_CODE__');
   });
 
   it('throws (not returns []) when structure is broken / nothing parsed', () => {
@@ -273,7 +277,11 @@ describe('parseAuctionsFromHtml', () => {
 });
 ```
 
-> 落地时：把第一个断言收紧为对 fixture 里真实存在的某个代码的精确断言（如 `expect(list.map(a=>a.code)).toContain('<真实代码>')`），避免"能过但没校验真值"。
+- [ ] **Step 2b: 用真实代码替换占位（防"能过但没校验真值"硬 gate）**
+
+打开 `test/fixtures/homepage-rendered.html`，找一个真实的 SALVAGENZ 拍卖代码（如 `ND130726`）填入
+`__FILL_REAL_SALVAGE_CODE__`，再找一个真实的 passenger/trucks 代码（如 `PS140726` 或 `PP120726`）
+填入 `__FILL_REAL_NON_SALVAGE_CODE__`。**未替换占位即视为未完成本步**（`toContain('__FILL...')` 必失败）。
 
 - [ ] **Step 3: 跑测试确认失败**
 
@@ -439,7 +447,11 @@ export async function syncRows(db, conn) {
     const [ins] = await conn.execute(sql, cols.map((c) => row[c]));
     const carId = ins.insertId; // MySQL 自增 id —— 图片外键必须用它，不是 SQLite id
 
-    const imgs = db.prepare('SELECT url FROM manheim_image WHERE manheim_id = ? AND url IS NOT NULL AND length(url) <= 255').all(row.id);
+    const allImgs = db.prepare('SELECT url FROM manheim_image WHERE manheim_id = ? AND url IS NOT NULL').all(row.id);
+    const imgs = allImgs.filter((im) => im.url.length <= 255); // MySQL url 列 varchar(255)
+    if (imgs.length !== allImgs.length) {
+      console.warn(`[sync] ${row.vin || row.item_id}: 丢弃 ${allImgs.length - imgs.length} 条 >255 字符的图片 URL（MySQL 列上限）`);
+    }
     for (const im of imgs) {
       await conn.execute(
         `INSERT INTO car_crawler_manheim_image (uuid,manheim_id,url,create_by,update_by,create_time,update_time)
@@ -511,7 +523,9 @@ export async function runAll(cfg = config) {
   const reports = [];
   for (const a of auctions) {
     try {
-      const r = await run({ ...cfg, auctionId: a.code });
+      // 每场 run() 只填 SQLite，禁用其内置写库（否则会每场各写一次 MySQL + 末尾再写一次，
+      // 且重复跑迁移/逐行 SELECT）。写回统一由本函数末尾做一次。
+      const r = await run({ ...cfg, auctionId: a.code, mysql: { ...cfg.mysql, enabled: false } });
       reports.push({ code: a.code, ...r });
       console.log(`[crawl] ${a.code}: expected=${r.expected} stored=${r.stored} missing=${r.missing.length}`);
     } catch (e) {
@@ -578,7 +592,7 @@ echo "=== $(date '+%F %T') sync-all end (exit $?) ===" >> scripts/cron.log
 - [ ] **Step 2: 写 README-cron.md（安装说明）**
 
 内容：
-- `.env` 需含 `DB_HOST/DB_USER/DB_PWD/DB_NAME`（gitignore 已含 `.env`）。
+- `.env` 需含 `MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DATABASE`（与 config.js 一致；gitignore 已含 `.env`）。可选 `MYSQL_SYNC=true`（脚本内也会设）。
 - 安装 crontab（每天 09:00 本地跑一次，避开 Java 的凌晨窗口）：
   ```
   crontab -l 2>/dev/null | grep -v cron-sync.sh; echo "0 9 * * * /Users/ying/Documents/Sunny/manheim-crawler/scripts/cron-sync.sh"

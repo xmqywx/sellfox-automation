@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { openDb, upsertVehicle, insertImages, recordFailed } from '../store/db.js';
 import { buildListingUrl, parseListing } from './listing.js';
 import { parseDetail } from './detail.js';
+import { enrichVehicle } from './enrich.js';
 import { fetchHtml } from './fetcher.js';
 import { closeBrowser } from './fallback.js';
 import { uploadImages } from '../media/s3.js';
@@ -42,6 +43,7 @@ export async function run(cfg = config) {
       // DETAIL
       const { vehicle, images } = parseDetail($, request.url);
       vehicle.fetch_mode = mode;
+      enrichVehicle(vehicle, cfg); // 注入 uuid=拍卖代码, plan_type=Salvage（生产 MySQL 需要）
 
       // 只在"连车辆基本信息都解析不到"时才判为空跳过（说明抓取/解析失败）。
       // 摩托/ATV 等无 vin/rego 但有 make + item_id 的车照常入库（用 item_id 兜底去重），不再漏。

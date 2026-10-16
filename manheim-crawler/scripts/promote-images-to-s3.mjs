@@ -25,11 +25,37 @@
  */
 import 'dotenv/config';
 import mysql from 'mysql2/promise';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 
 const execFileAsync = promisify(execFile);
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// 用 curl 下载到临时文件（undici/fetch 被 Manheim 指纹/UA 拦 403；curl 走本地代理可达）。
+// 返回 { file, ct }；调用方负责 unlink。失败抛错。
+async function curlDownload(url) {
+  const file = join(tmpdir(), `promo-${randomBytes(6).toString('hex')}`);
+  const { stdout } = await execFileAsync('curl', [
+    '-sL', '-A', UA, '--max-time', '30',
+    '--retry', '3', '--retry-connrefused', '--retry-delay', '2',
+    '-o', file, '-w', '%{http_code} %{content_type}', url,
+  ], { maxBuffer: 32 * 1024 * 1024 });
+  const [code, ct] = String(stdout).trim().split(/\s+/);
+  if (code !== '200') { await unlink(file).catch(() => {}); throw new Error('download ' + code); }
+  return { file, ct: ct || 'image/jpeg' };
+}
+
+// 用 aws CLI 上传（@aws-sdk/client-s3 不认 HTTP_PROXY 会被沙箱直连拦；aws CLI 认代理）。
+async function awsUpload(file, bucket, key, ct) {
+  await execFileAsync('aws', [
+    's3', 'cp', file, `s3://${bucket}/${key}`,
+    '--content-type', ct, '--only-show-errors',
+  ], { maxBuffer: 8 * 1024 * 1024 });
+}
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);
 const val = (f, d) => { const i = argv.indexOf(f); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
@@ -48,10 +74,9 @@ function requireEnv(name) {
   return v;
 }
 
-const s3 = new S3Client({
-  region: REGION,
-  credentials: { accessKeyId: requireEnv('AWS_ACCESS_KEY_ID'), secretAccessKey: requireEnv('AWS_SECRET_ACCESS_KEY') },
-});
+// aws CLI 从环境读凭证；这里仅校验已设置，并给出清晰报错
+requireEnv('AWS_ACCESS_KEY_ID');
+requireEnv('AWS_SECRET_ACCESS_KEY');
 
 async function httpStatus(url) {
   try {
@@ -92,11 +117,12 @@ for (const r of rows) {
   const srcUrl = 'https://' + r.url;
   const key = r.url.replace(/^img\.manheim\.com\.au\//, '');
   try {
-    const res = await fetch(srcUrl);
-    if (!res.ok) throw new Error('download ' + res.status);
-    const buf = Buffer.from(await res.arrayBuffer());
-    const ct = res.headers.get('content-type') || 'image/jpeg';
-    await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: buf, ContentType: ct }));
+    const { file, ct } = await curlDownload(srcUrl);
+    try {
+      await awsUpload(file, BUCKET, key, ct);
+    } finally {
+      await unlink(file).catch(() => {});
+    }
     const s3url = `${S3_HOST}/${key}`;
     const code = await httpStatus('https://' + s3url);
     if (code !== '200') throw new Error('s3 url not 200: ' + code);
